@@ -7,6 +7,8 @@
 #include <cassert>
 #include <cinttypes>
 
+#include "rt64_snap_diag.h"
+
 #include "im3d/im3d.h"
 #include "im3d/im3d_math.h"
 #include "imgui/imgui.h"
@@ -20,6 +22,7 @@
 
 #include "rt64_application.h"
 #include "rt64_interpreter.h"
+#include "render/rt64_snap_recolor.h"
 
 //#define ASSERT_ON_BLENDER_EMULATION
 #define SYNC_ON_EVERY_FB_PAIR 0
@@ -129,6 +132,11 @@ namespace RT64 {
         drawCall.rdpParams.envColor = { 0.0f, 0.0f, 0.0f, 0.0f };
         drawCall.rdpParams.fogColor = { 0.0f, 0.0f, 0.0f, 0.0f };
         drawCall.rdpParams.blendColor = { 0.0f, 0.0f, 0.0f, 0.0f };
+        drawCall.rdpParams.snapPrevPrimColor = { 0.0f, 0.0f, 0.0f, 0.0f };
+        drawCall.rdpParams.snapPrimBlend = 0.0f;
+        drawCall.rdpParams.snapPrimPad0 = 0.0f;
+        drawCall.rdpParams.snapPrimPad1 = 0.0f;
+        drawCall.rdpParams.snapPrimPad2 = 0.0f;
         drawCall.cullBothMask = 0;
         drawCall.shadingSmoothMask = 0;
         drawCall.NoN = false;
@@ -367,6 +375,7 @@ namespace RT64 {
                         dstCallTile.tmemHashOrID = checkResult.tileId;
                         dstCallTile.tileCopyWidth = checkResult.tileWidth;
                         dstCallTile.tileCopyHeight = checkResult.tileHeight;
+                        dstCallTile.tileCopyRowOffset = checkResult.rowOffset;
 
                         // We must force reinterpretation if a LUT format is used.
                         const uint32_t tlutFormat = rdp->otherMode.textLUT();
@@ -380,6 +389,7 @@ namespace RT64 {
                     }
                     else {
                         dstCallTile.tileCopyUsed = false;
+                        dstCallTile.tileCopyRowOffset = 0;
                         dstCallTile.tmemHashOrID = rdp->tileReplacementHashes[tileIndex];
 
                         if (checkResult.syncRequired) {
@@ -476,6 +486,15 @@ namespace RT64 {
         // Add the draw call to the FB pair.
         GameCall gameCall;
         gameCall.callDesc = drawCall;
+
+        // Pokemon Snap port, opt-in: Jynx's face and hands take the purple of
+        // Nintendo's re-releases (render/rt64_snap_recolor.h). Applied to the
+        // recorded copy so the RDP's own primitive colour, which later draws
+        // inherit, stays what the cartridge set.
+        if (ext.userConfig->snapJynxVC) {
+            SnapJynxVC::apply(gameCall.callDesc);
+        }
+
         fbPair.addGameCall(gameCall);
 
         // Assign the indices or increase the count of the active sprite command if it exists.
@@ -581,6 +600,28 @@ namespace RT64 {
                 fbPair.syncRequired = true;
             }
 
+            // Pokemon Snap port: a small colour render that is not the screen
+            // may be a photo the game's CPU will halve into a sprite; pin a
+            // halved copy of it, queued to run right after this pair renders
+            // (hle/rt64_snap_photo_detail.h). Off, nothing here runs.
+            if (ext.userConfig->snapPhotoDetail) {
+                uint32_t snapScreens[4];
+                size_t snapScreenCount = 0;
+                for (const VIHistory::Present &entry : viHistory.history) {
+                    if (entry.vi.visible()) {
+                        snapScreens[snapScreenCount++] = entry.vi.fbAddress();
+                    }
+                }
+
+                if (lastScreenVI.visible()) {
+                    snapScreens[snapScreenCount++] = lastScreenVI.fbAddress();
+                }
+
+                const uint32_t snapDrawnWidth = uint32_t(std::max(0, std::min(fbPair.drawColorRect.right(true), int32_t(colorImg.width))));
+                snapPhotoDetail.beginRender(framebufferManager, fbPair.endFbOperations, colorImg.address, colorImg.width, colorImg.siz,
+                    snapDrawnWidth, colorHeight, uint32_t(fbPairIndex), snapScreens, snapScreenCount);
+            }
+
             uint32_t colorFbBytes = colorFb->imageRowBytes(colorWriteWidth) * colorFb->height;
             uint64_t writeTimestamp = framebufferManager.nextWriteTimestamp();
             colorFb->RAMBytes = std::max(colorFb->RAMBytes, colorFbBytes);
@@ -620,6 +661,23 @@ namespace RT64 {
         if (!rdramCheckPending) {
             return;
         }
+
+        // Timed because this runs on the GAME thread, inside the display
+        // list walk, and when it finds the framebuffer changed it uploads
+        // and then blocks until the GPU has finished. None of that shows up
+        // in the slow-frame line as renderer time.
+        const auto snapCheckStart = snapdiag::statsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct SnapCheckTimer {
+            std::chrono::steady_clock::time_point start;
+            ~SnapCheckTimer() {
+                if (snapdiag::statsEnabled()) {
+                    snapdiag::rdramCheckNanos().fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start).count(),
+                        std::memory_order_relaxed);
+                }
+            }
+        } snapCheckTimer{snapCheckStart};
         
         assert(drawFbOperations.empty() && "There should be no pending framebuffer operations when this is started.");
         assert(drawFbDiscards.empty() && "There should be no pending framebuffer discards when this is started.");
@@ -631,6 +689,7 @@ namespace RT64 {
             framebufferManager.storeRAM(workload.fbStorage, RDRAM, fbPairIndex);
             framebufferManager.checkRAM(RDRAM, differentFbs, true);
             if (!differentFbs.empty()) {
+                snapdiag::rdramUploadCounter().fetch_add(1, std::memory_order_relaxed);
                 RenderWorkerExecution execution(ext.framebufferGraphicsWorker);
                 framebufferManager.uploadRAM(ext.framebufferGraphicsWorker, differentFbs.data(), differentFbs.size(), workload.fbChangePool, RDRAM, true, drawFbOperations, drawFbDiscards, ext.shaderLibrary);
             }
@@ -979,7 +1038,7 @@ namespace RT64 {
 
                     // Check if the blender uses a standard fog cycle. We override it and indicate it on
                     // the material for the RT path to use its own fog handling.
-                    interop::Blender::EmulationRequirements blenderEmuReqs = interop::Blender::checkEmulationRequirements(callDesc.otherMode);
+                    interop::Blender::EmulationRequirements blenderEmuReqs = interop::Blender::checkEmulationRequirements(shaderDesc.otherMode);
 #               ifdef ASSERT_ON_BLENDER_EMULATION
                     assert(blenderEmuReqs.simpleEmulation || (blenderEmuReqs.approximateEmulation != interop::Blender::Approximation::None));
 #               endif
@@ -999,8 +1058,8 @@ namespace RT64 {
                     auto &flags = shaderDesc.flags;
                     flags.rect = (proj.type == Projection::Type::Rectangle);
                     flags.linearFiltering = linearFiltering || forceLinearFiltering;
-                    flags.usesTexture0 = callDesc.colorCombiner.usesTexture(callDesc.otherMode, 0, oneCycleHardwareBug);
-                    flags.usesTexture1 = callDesc.colorCombiner.usesTexture(callDesc.otherMode, 1, oneCycleHardwareBug);
+                    flags.usesTexture0 = callDesc.colorCombiner.usesTexture(shaderDesc.otherMode, 0, oneCycleHardwareBug);
+                    flags.usesTexture1 = callDesc.colorCombiner.usesTexture(shaderDesc.otherMode, 1, oneCycleHardwareBug);
                     flags.blenderApproximation = static_cast<unsigned>(blenderEmuReqs.approximateEmulation);
                     flags.usesHDR = usesHDR;
                     flags.sampleCount = renderFlagSampleCount;
@@ -1280,7 +1339,18 @@ namespace RT64 {
                 while (pairCursor < maxFramebufferPair) {
                     const FramebufferPair &fbPair = workload.fbPairs[pairCursor];
                     if (getTargetsFromPair(pairCursor)) {
-                        RenderFramebufferStorage &fbStorage = renderFramebufferManager->get(fbKey, colorTarget, (depthTarget != nullptr) ? depthTarget : dummyDepthTarget.get());
+                        // Pokemon Snap port: a target created for this frame
+                        // is cleared before it is drawn into; the RAM read
+                        // above already cleared any it reached
+                        // (rt64_render_target.cpp, snapFreshMemory).
+                        if ((colorTarget != nullptr) && colorTarget->snapFreshMemory) {
+                            colorTarget->setupColorFramebuffer(ext.framebufferGraphicsWorker);
+                        }
+                        RenderTarget *passDepthTarget = (depthTarget != nullptr) ? depthTarget : dummyDepthTarget.get();
+                        if ((passDepthTarget != nullptr) && passDepthTarget->snapFreshMemory) {
+                            passDepthTarget->setupDepthFramebuffer(ext.framebufferGraphicsWorker);
+                        }
+                        RenderFramebufferStorage &fbStorage = renderFramebufferManager->get(fbKey, colorTarget, passDepthTarget);
                         FramebufferRenderer::DrawParams drawParams;
                         drawParams.worker = ext.framebufferGraphicsWorker;
                         drawParams.fbStorage = &fbStorage;
@@ -1303,6 +1373,7 @@ namespace RT64 {
                         drawParams.postBlendNoise = ext.emulatorConfig->dither.postBlendNoise;
                         drawParams.postBlendNoiseNegative = ext.emulatorConfig->dither.postBlendNoiseNegative;
                         drawParams.maxGameCall = UINT_MAX;
+                        drawParams.snapRectWeight = 1.0f;
                         framebufferRenderer->addFramebuffer(drawParams);
                     }
 
@@ -1353,6 +1424,9 @@ namespace RT64 {
                 pairCursor = framebufferPairCursor;
                 while (pairCursor < maxFramebufferPair) {
                     FramebufferPair &fbPair = workload.fbPairs[pairCursor];
+                    if (snapdiag::opTraceEnabled()) {
+                        snapdiag::opTrace("Framebuffer", "native pass pair %u: color %08X w %u, workload %u", pairCursor, fbPair.colorImage.address, fbPair.colorImage.width, workload.workloadId);
+                    }
                     framebufferManager.recordOperations(ext.framebufferGraphicsWorker, &workload.fbChangePool, &workload.fbStorage, ext.shaderLibrary, ext.textureCache,
                         fbPair.startFbOperations, renderTargetManager, resolutionScale, pairCursor, workload.submissionFrame);
 
@@ -1478,6 +1552,15 @@ namespace RT64 {
                     if (getFramebufferPairs(pairCursor)) {
                         colorFb->copyNativeToRAM(&RDRAM[colorFb->addressStart], colorWriteWidth, colorRowStart, std::min(colorRowEnd, colorFb->height));
 
+                        // Pokemon Snap port: these rows are what the game's
+                        // CPU halves into a photo sprite; note what that
+                        // halving yields so the sprite can be recognised
+                        // (hle/rt64_snap_photo_detail.h). Off, nothing here
+                        // runs.
+                        if (ext.userConfig->snapPhotoDetail) {
+                            snapPhotoDetail.fillPixels(RDRAM, pairCursor);
+                        }
+
                         if (depthWriteWidth > 0) {
                             depthFb->copyNativeToRAM(&RDRAM[depthFb->addressStart], depthWriteWidth, depthRowStart, std::min(depthRowEnd, depthFb->height));
                         }
@@ -1541,6 +1624,25 @@ namespace RT64 {
             // Perform any preliminar setup before processing the framebuffer pairs.
             renderSetup();
 
+            // Pokemon Snap port, diagnostic: every synchronized pair below is
+            // a GPU submit and wait taken on the game thread, and the frames
+            // the player feels a hitch on are the ones with many of them. Per
+            // frame this reports how many fired and what they cost. Behind
+            // the diagnostics gate, clocks included: quiet builds pay nothing.
+            const bool snapSyncDiag = snapdiag::diagEnabled();
+            int64_t snapSyncMicro = 0;
+            uint32_t snapSyncCount = 0;
+            const auto snapSyncTimed = [&](uint32_t maxFramebufferPair) {
+                if (snapSyncDiag) {
+                    const auto snapSyncStart = std::chrono::steady_clock::now();
+                    renderAndSynchronize(maxFramebufferPair);
+                    snapSyncMicro += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - snapSyncStart).count();
+                }
+                else {
+                    renderAndSynchronize(maxFramebufferPair);
+                }
+            };
+
             // Start loading tiles, sampling tiles and drawing the framebuffer pairs as required.
             for (uint32_t f = 0; f < workload.fbPairCount; f++) {
                 FramebufferPair &fbPair = workload.fbPairs[f];
@@ -1553,15 +1655,22 @@ namespace RT64 {
                 }
 
                 if (fbPair.syncRequired) {
-                    renderAndSynchronize(f);
+                    snapSyncTimed(f);
                     renderSetup();
+                    snapSyncCount++;
                 }
 
                 fullSyncFramebufferPairTiles(workload, fbPair, loadOpCursor, rdpTileCursor);
             }
 
             // Render any remaining batches of framebuffers.
-            renderAndSynchronize(workload.fbPairCount);
+            snapSyncTimed(workload.fbPairCount);
+
+            if (snapSyncDiag && (snapSyncMicro > 5000)) {
+                fprintf(stdout, "[SNAP-SYNC] pairs %u midframe syncs %u total %lld us\n",
+                    workload.fbPairCount, snapSyncCount, (long long)snapSyncMicro);
+                fflush(stdout);
+            }
         }
         else {
             // Process all tiles.
@@ -1589,6 +1698,15 @@ namespace RT64 {
         // The texture manager should also be notified of any hashes that were removed.
         if (ext.textureCache->evict(workloadCounter, evictedTextureHashes)) {
             textureManager.removeHashes(evictedTextureHashes);
+        }
+
+        // Pokemon Snap port: release the photo pins that never got their rows
+        // back, and every pin once the setting is off.
+        if (ext.userConfig->snapPhotoDetail) {
+            snapPhotoDetail.endDisplayList(framebufferManager);
+        }
+        else if (!snapPhotoDetail.candidates.empty()) {
+            snapPhotoDetail.clear(framebufferManager);
         }
 
         if (renderToRDRAM) {
@@ -2065,11 +2183,17 @@ namespace RT64 {
             ext.sharedQueueResources->configurationMutex.lock();
             const hlslpp::float2 resolutionScale = ext.sharedQueueResources->resolutionScale;
             bool removeBlackBorders = ext.sharedQueueResources->enhancementConfig.presentation.removeBlackBorders;
+            // The same crop presentation applies, or the cursor maps against a
+            // viewport the screen is not showing.
+            uint32_t pickCrop[4];
+            for (uint32_t i = 0; i < 4; i++) {
+                pickCrop[i] = ext.sharedQueueResources->enhancementConfig.presentation.crop[i];
+            }
             const uint32_t downsampleMultiplier = ext.userConfig->downsampleMultiplier;
             ext.sharedQueueResources->configurationMutex.unlock();
             RenderViewport viewport;
             RenderRect scissor;
-            VIRenderer::getViewportAndScissor(ext.swapChain, lastScreenVI, resolutionScale, downsampleMultiplier, removeBlackBorders, viewport, scissor);
+            VIRenderer::getViewportAndScissor(ext.swapChain, lastScreenVI, resolutionScale, downsampleMultiplier, removeBlackBorders, pickCrop, viewport, scissor);
 
             // Convert the mouse coordinates to native coordinates.
             hlslpp::float2 screenCursorPos;
@@ -2722,6 +2846,33 @@ namespace RT64 {
 
     void State::setRenderToRAM(uint8_t renderToRAM) {
         extended.renderToRAM = renderToRAM;
+    }
+
+    // Pokemon Snap port: the game-side camera hook marks a cut-transit frame
+    // in word3 of its matrix group packet. This lands the mark on the
+    // workload this display list is filling -- in-band with the exact frame
+    // the verdict was computed for, with no cross-frame global whose
+    // consumption could drift from its frame.
+    // Pokemon Snap port: records an object the game's animation data says
+    // stepped this frame. In-band with the display list, so it lands on the
+    // workload it was computed for.
+    void State::snapAuthoredStepCommand(uint32_t id) {
+        ext.workloadQueue->workloads[ext.workloadQueue->writeCursor].snapAddSteppedId(id);
+    }
+
+    // The id names the element; the ordinal counts the rectangles it draws.
+    // A background made of twenty identical strips needs both: the id says
+    // which twenty rectangles belong together, and the ordinal says which of
+    // them this one is, so strip three pairs with strip three rather than
+    // with whichever strip happened to land nearest it on screen.
+    void State::snapRectGroupCommand(uint32_t id, bool single) {
+        rdp->extended.global.snapRectId = id;
+        rdp->extended.global.snapRectOrdinal = 0;
+        rdp->extended.global.snapRectSingle = single;
+    }
+
+    void State::snapCutHoldCommand() {
+        ext.workloadQueue->workloads[ext.workloadQueue->writeCursor].snapCutHold = true;
     }
 
     void State::setDitherNoiseStrength(float noiseStrength) {

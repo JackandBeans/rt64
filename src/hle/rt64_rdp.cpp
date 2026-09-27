@@ -6,6 +6,7 @@
 
 #include <cassert>
 
+
 #include "../include/rt64_extended_gbi.h"
 
 #include "common/rt64_math.h"
@@ -132,6 +133,35 @@ namespace RT64 {
     
     void RDP::checkFramebufferOverlap(uint32_t tmemStart, uint32_t tmemWords, uint32_t tmemMask, uint32_t addressStart, uint32_t addressEnd, uint32_t tileWidth, uint32_t tileHeight, bool RGBA32, bool makeTileCopy) {
         auto &fbManager = state->framebufferManager;
+
+        // Pokemon Snap port: a load from plain memory may be a photo -- the
+        // bitmap the game's CPU halved from a render this renderer made and
+        // pinned a halved copy of. When it is, the TMEM it fills is tagged
+        // with those rows of the pinned copy (hle/rt64_snap_photo_detail.h).
+        // Only with the setting on; the comparison is the whole loaded range
+        // against the bitmap the game computed, halfword for halfword, so
+        // nothing else is ever substituted. Asked FIRST, before the address
+        // check below: the bitmaps live on the game's heap, where a buffer
+        // some earlier screen rendered into may have sat, and the record of
+        // that framebuffer outlives the screen. A load inside such a record
+        // used to be treated as a read of that framebuffer, which the CPU
+        // had since overwritten, so the sprite fell back to the console's
+        // halved texels while the same photo elsewhere was served in full.
+        // Exact content identity outranks an address heuristic.
+        if (makeTileCopy && !RGBA32 && state->ext.userConfig->snapPhotoDetail && state->ext.emulatorConfig->framebuffer.copyWithGPU) {
+            SnapPhotoDetail::Match match;
+            if (state->snapPhotoDetail.match(state->RDRAM, addressStart, addressEnd, fbManager.getUsedTimestamp(), match)) {
+                const FramebufferTile fbTile = SnapPhotoDetail::makeRegionTile(match);
+                fbManager.insertRegionsTMEM(fbTile.address, tmemStart, std::min(tmemWords, uint32_t(RDP_TMEM_WORDS)), tmemMask, false, false, &regionIterators);
+                for (FramebufferManager::RegionIterator regionIt : regionIterators) {
+                    regionIt->fbTile = fbTile;
+                    regionIt->tileCopyId = match.candidate->tileId;
+                }
+
+                return;
+            }
+        }
+
         Framebuffer *fb = fbManager.findMostRecentContaining(addressStart, addressEnd);
         if (fb != nullptr) {
             const bool gpuCopiesEnabled = state->ext.emulatorConfig->framebuffer.copyWithGPU;
@@ -475,6 +505,7 @@ namespace RT64 {
         const uint32_t bytesOffset = (loadTile.uls >> 2) << loadTexture.siz >> 1;
         const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
         const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * (loadTile.ult >> 2);
+
         const uint32_t rowCount = 1 + ((loadTile.lrt >> 2) - (loadTile.ult >> 2));
         const uint32_t tileWidth = ((loadTile.lrs >> 2) - (loadTile.uls >> 2));
         const uint32_t wordsPerRow = (tileWidth >> (4 - loadTile.siz)) + 1;
@@ -515,6 +546,7 @@ namespace RT64 {
         const uint32_t bytesOffset = loadTile.uls << loadTexture.siz >> 1;
         const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
         const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * loadTile.ult;
+
         const uint32_t wordCount = ((loadTile.lrs - loadTile.uls) >> (4 - loadTile.siz)) + 1;
         const uint32_t tmemStart = loadTile.tmem << 3;
         const uint32_t tmemStride = loadTile.line << 3;
@@ -551,6 +583,7 @@ namespace RT64 {
         const uint32_t bytesOffset = (loadTile.uls >> 2) << loadTexture.siz >> 1;
         const uint32_t bytesPerRow = loadTexture.width << loadTexture.siz >> 1;
         const uint32_t textureStart = loadTexture.address + bytesOffset + bytesPerRow * (loadTile.ult >> 2);
+
         const uint32_t rowCount = 1 + ((loadTile.lrt >> 2) - (loadTile.ult >> 2));
         const uint32_t wordsPerRow = ((loadTile.lrs >> 2) - (loadTile.uls >> 2)) + 1;
         const uint32_t tmemStart = loadTile.tmem << 3;
@@ -959,7 +992,18 @@ namespace RT64 {
     }
     
     void RDP::setPrimDepth(uint16_t z, uint16_t dz) {
-        const float Fixed15ToFloat = 1.0f / 32767.0f;
+        // 1/32768, not 1/32767: geometry depth is normalised as viewport units
+        // over 1024, which makes a 15-bit hardware z exactly z/32768 in the
+        // depth buffer. Decoding the primitive depth with the off-by-one
+        // divisor renders every G_ZS_PRIM draw about one 15-bit step farther
+        // than the geometry it was authored against -- a bias that grows with
+        // the square of distance in world units, and quietly buries sprites
+        // that sit a small distance in front of a large surface. Snap's sleep
+        // effect over Snorlax is drawn exactly that way (a prim-depth textured
+        // rectangle with a transparent, non-writing compare) and vanished once
+        // the cart was far enough away; on hardware the sprite and the scene
+        // share one scale, so it never loses.
+        const float Fixed15ToFloat = 1.0f / 32768.0f;
         const float Fixed16ToFloat = 1.0f / 65535.0f;
         hlslpp::float2 &primDepth = primDepthStack[primDepthStackSize - 1];
         primDepth.x = (z & 0x7FFFU) * Fixed15ToFloat;
@@ -1083,6 +1127,9 @@ namespace RT64 {
         extended.global.rect = ExtendedAlignment();
         extended.global.scissor = ExtendedAlignment();
         extended.global.rectAspect = G_EX_ASPECT_AUTO;
+        extended.global.snapRectId = 0;
+        extended.global.snapRectOrdinal = 0;
+        extended.global.snapRectSingle = false;
     }
     
     void RDP::drawTris(uint32_t triCount, const float *pos, const float *tc, const float *col, uint8_t tile, uint8_t levels) {
@@ -1092,6 +1139,9 @@ namespace RT64 {
         // Check if the texture needs to be updated.
         DrawCall &drawCall = state->drawCall;
         if (!drawCall.textureOn || (drawCall.textureTile != tile) || (drawCall.textureLevels != levels)) {
+            // Pokemon Snap port: the pending call keeps the texture state it
+            // was drawn with (see RSP::drawIndexedTri).
+            state->flush();
             drawCall.textureOn = 1;
             drawCall.textureTile = tile;
             drawCall.textureLevels = levels;
@@ -1235,6 +1285,26 @@ namespace RT64 {
         drawCall.rectLeftOrigin = extAlignment.leftOrigin;
         drawCall.rectRightOrigin = extAlignment.rightOrigin;
         drawCall.rectAspect = extended.global.rectAspect;
+        // Only rectangles inside a group carry an identity. Everything else
+        // keeps id zero, which never matches anything, so it is drawn exactly
+        // where the game asked for it -- the behaviour of every rectangle
+        // before this existed.
+        drawCall.snapRectId = extended.global.snapRectId;
+        drawCall.snapRectOrdinal = extended.global.snapRectOrdinal;
+        drawCall.snapPrevRect = FixedRect();
+        drawCall.snapPrevDsdx = 0;
+        drawCall.snapPrevDtdy = 0;
+        drawCall.snapRectMapped = false;
+        if (extended.global.snapRectId != 0) {
+            extended.global.snapRectOrdinal++;
+
+            // A single-rectangle group has now had its rectangle. Whatever is
+            // drawn next carries no name unless something names it.
+            if (extended.global.snapRectSingle) {
+                extended.global.snapRectId = 0;
+                extended.global.snapRectSingle = false;
+            }
+        }
 
         if (flushedState) {
             state->loadDrawState();
@@ -1325,6 +1395,9 @@ namespace RT64 {
         // Check if the texture needs to be updated.
         DrawCall &drawCall = state->drawCall;
         if (!drawCall.textureOn || (drawCall.textureTile != tile) || (drawCall.textureLevels != 1)) {
+            // Pokemon Snap port: the pending call keeps the texture state it
+            // was drawn with (see RSP::drawIndexedTri).
+            state->flush();
             drawCall.textureOn = 1;
             drawCall.textureTile = tile;
             drawCall.textureLevels = 1;

@@ -4,6 +4,23 @@
 
 #include "rt64_framebuffer_renderer.h"
 
+#include <atomic>
+#include <cstdarg>
+
+#include <cstdlib>
+#include <cstring>
+
+#include <atomic>
+#include <cmath>
+
+#include "hle/rt64_snap_diag.h"
+
+// Pokemon Snap port: the presented-frame capture window (rt64_present_queue.cpp).
+// While a burst is being photographed, every named rectangle draw below prints
+// the weight and endpoints it was actually placed with, one line per sub-frame,
+// so the smear in a picture can be read back to the exact lerp that drew it.
+extern "C" std::atomic<int32_t> snap_frame_dump_pending;
+
 #include "../include/rt64_extended_gbi.h"
 
 #include "common/rt64_elapsed_timer.h"
@@ -76,8 +93,22 @@ namespace RT64 {
             int32_t right = static_cast<int32_t>(std::ceil((computeOrigin(rightOrigin) + (rect.right(true) - computeOrigin(rightOrigin)) * aspectRatioScale) * resScale.x));
             int32_t top = lround(rect.top(true) * resScale.y);
             int32_t bottom = lround(rect.bottom(true) * resScale.y);
+            const int32_t rightUnaligned = right;
             left = correctMisalignment(left, leftOrigin);
             right = correctMisalignment(right, rightOrigin);
+
+            // Pokemon Snap port: the alignment above snaps a right-anchored
+            // edge down to the native pixel grid and takes the target's
+            // misalignment off it, so an edge the game put on the picture's
+            // right edge landed up to a native pixel short of it: a slit of
+            // the scene beside the viewfinder's black bands, ten pixels wide
+            // at 2560x1440. An edge that reached the target's right edge
+            // stays on it.
+            const int32_t rightEdge = int32_t(std::lround(fbWidth * resScale.x));
+            if ((rightOrigin == G_EX_ORIGIN_RIGHT) && (rightUnaligned >= rightEdge)) {
+                right = rightEdge;
+            }
+
             return RenderRect(left, top, right, bottom);
         }
         else {
@@ -125,6 +156,36 @@ namespace RT64 {
         return { v.x, v.y, v.z, v.w };
     }
 
+    // Pokemon Snap port, diagnostic (SNAP_DRAW_TRACE): see the projection loop.
+    static bool snapDrawTraceActive() {
+        static const long traceFrame = []() {
+            const char *env = std::getenv("SNAP_DRAW_TRACE");
+            return (env != nullptr) ? std::atol(env) : -1L;
+        }();
+        if (traceFrame < 0) {
+            return false;
+        }
+
+        const long g = long(snapdiag::gameFrameCounter().load(std::memory_order_relaxed));
+        return (g >= traceFrame - 2) && (g <= traceFrame + 2);
+    }
+
+    static void snapDrawTraceLine(const char *fmt, ...) {
+        static std::atomic<uint32_t> lines{0};
+        if (lines.fetch_add(1) >= 6000) {
+            return;
+        }
+
+        char text[512];
+        const int n = snprintf(text, sizeof(text), "[SNAP-DRAW] g%u ", snapdiag::gameFrameCounter().load(std::memory_order_relaxed));
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(text + n, sizeof(text) - size_t(n), fmt, args);
+        va_end(args);
+        fputs(text, stdout);
+        fputc('\n', stdout);
+    }
+
     static RenderRect viewportScissorIntersection(const RenderViewport &viewport, const RenderRect &scissor) {
         return RenderRect{
             std::max(static_cast<int32_t>(std::floor(viewport.x)), scissor.left),
@@ -165,6 +226,8 @@ namespace RT64 {
         dummyDepthTargetView.reset();
         dummyColorTarget.reset();
         dummyDepthTarget.reset();
+        snapFallbackTexture.reset();
+        snapFallbackUpload.reset();
     }
     
     void FramebufferRenderer::resetFramebuffers(RenderWorker *worker, bool ubershadersVisible, float ditherNoiseStrength, const RenderMultisampling &multisampling) {
@@ -183,6 +246,22 @@ namespace RT64 {
             dummyColorTarget->setName("Framebuffer Renderer Color Dummy");
             dummyColorTargetView = dummyColorTarget->createTextureView(RenderTextureViewDesc::Texture2D(dummyColorDesc.format));
             dummyColorTargetTransitioned = false;
+        }
+
+        // Pokemon Snap port: the fallback texel, made once; its upload is
+        // recorded by the first recordSetup after this (a texture starts with
+        // whatever memory held, and this one must be nothing).
+        if (snapFallbackTexture == nullptr) {
+            snapFallbackTexture = worker->device->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, RenderFormat::R8G8B8A8_UNORM));
+            snapFallbackTexture->setName("Snap Fallback Texel");
+            snapFallbackUpload = worker->device->createBuffer(RenderBufferDesc::UploadBuffer(256));
+            void *uploadData = snapFallbackUpload->map();
+            if (uploadData != nullptr) {
+                memset(uploadData, 0, 256);
+                snapFallbackUpload->unmap();
+            }
+
+            snapFallbackUploaded = false;
         }
 
         // Create dummy depth target if it hasn't been created yet.
@@ -235,13 +314,28 @@ namespace RT64 {
             interop::GPUTile &gpuTile = dstGPUTiles[i];
             if (callTile.tileCopyUsed) {
                 const auto &it = fbManager->tileCopies.find(callTile.tmemHashOrID);
-                if (it != fbManager->tileCopies.end()) {
+                // A copy that was set up without a texture (its source had
+                // nothing to give) binds the blank texture rather than null.
+                if ((it != fbManager->tileCopies.end()) && (it->second.texture != nullptr)) {
                     const FramebufferManager::TileCopy &tileCopy = it->second;
-                    gpuTile.tcScale.x = static_cast<float>(tileCopy.usedWidth) / static_cast<float>(callTile.tileCopyWidth);
-                    gpuTile.tcScale.y = static_cast<float>(tileCopy.usedHeight) / static_cast<float>(callTile.tileCopyHeight);
+                    if (tileCopy.snapWhole) {
+                        // Pokemon Snap port: the copy is a whole halved photo
+                        // and this tile samples a run of its rows, so the
+                        // scale is the copy's own and the rows are an offset
+                        // (hle/rt64_snap_photo_detail.h).
+                        gpuTile.tcScale.x = static_cast<float>(tileCopy.usedWidth) / static_cast<float>(std::max(tileCopy.nativeWidth, 1u));
+                        gpuTile.tcScale.y = static_cast<float>(tileCopy.usedHeight) / static_cast<float>(std::max(tileCopy.nativeHeight, 1u));
+                        gpuTile.texelShift = tileCopy.texelShift;
+                        gpuTile.texelShift.y += uint32_t(std::lround(callTile.tileCopyRowOffset * gpuTile.tcScale.y));
+                    }
+                    else {
+                        gpuTile.tcScale.x = static_cast<float>(tileCopy.usedWidth) / static_cast<float>(callTile.tileCopyWidth);
+                        gpuTile.tcScale.y = static_cast<float>(tileCopy.usedHeight) / static_cast<float>(callTile.tileCopyHeight);
+                        gpuTile.texelShift = tileCopy.texelShift;
+                    }
+
                     gpuTile.ulScale.x = tileCopy.ulScaleS ? gpuTile.tcScale.x : 1.0f;
                     gpuTile.ulScale.y = tileCopy.ulScaleT ? gpuTile.tcScale.y : 1.0f;
-                    gpuTile.texelShift = tileCopy.texelShift;
                     gpuTile.texelMask = tileCopy.texelMask;
                     gpuTile.textureIndex = getTextureIndex(tileCopy);
                     gpuTile.textureDimensions = interop::float3(float(tileCopy.textureWidth), float(tileCopy.textureHeight), 1.0f);
@@ -250,6 +344,33 @@ namespace RT64 {
                     gpuTile.flags.fromCopy = true;
                     gpuTile.flags.rawTMEM = false;
                     gpuTile.flags.hasMipmaps = false;
+                }
+                else if (snapFallbackTexture != nullptr) {
+                    // Pokemon Snap port: no copy to draw from -- destroyed, or
+                    // never made because its source had nothing to give. Left
+                    // as it was, the tile named texture 0 with a scale of
+                    // zero, and on an AMD card under D3D12 1.0.3 lost the
+                    // device to that (DXGI_ERROR_DEVICE_REMOVED, twice of two
+                    // runs) on the first frame after a switch to fullscreen
+                    // on Oak's check, whose pinned copies the switch had
+                    // destroyed (issue #12). The pinned copies survive that
+                    // now; what still goes missing draws one transparent
+                    // black texel, and nothing faults.
+                    const uint32_t dstIndex = getDestinationIndex();
+                    dynamicTextureViewVector.emplace_back(DynamicTextureView{ snapFallbackTexture.get(), dstIndex, nullptr });
+                    dynamicTextureBarrierVector.emplace_back(RenderTextureBarrier(snapFallbackTexture.get(), RenderTextureLayout::SHADER_READ));
+                    gpuTile.tcScale = { 1.0f, 1.0f };
+                    gpuTile.ulScale = { 1.0f, 1.0f };
+                    gpuTile.texelShift = { 0, 0 };
+                    gpuTile.texelMask = { UINT_MAX, UINT_MAX };
+                    gpuTile.textureIndex = dstIndex;
+                    gpuTile.textureDimensions = interop::float3(1.0f, 1.0f, 1.0f);
+                    gpuTile.flags.alphaIsCvg = false;
+                    gpuTile.flags.highRes = false;
+                    gpuTile.flags.fromCopy = false;
+                    gpuTile.flags.rawTMEM = false;
+                    gpuTile.flags.hasMipmaps = false;
+                    gpuTile.flags.shiftedByHalf = false;
                 }
             }
             else {
@@ -312,7 +433,13 @@ namespace RT64 {
         
         const bool createSet = (descTextureSet == nullptr) || (descTextureSet->textureCacheSize < (textureCacheSize + 1));
         if (createSet) {
-            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, ((textureCacheSize + 1) * 3) / 2);
+            // Pokemon Snap port: a generous floor, because crossing the old
+            // 1.5x growth threshold rebuilt the whole shader-visible texture
+            // set mid-game -- exactly when a spawn burst brings new textures,
+            // on the workload thread, under the mutex the present waits on.
+            // Descriptors are cheap; a mid-course rebuild is a stall.
+            const uint32_t grown = ((textureCacheSize + 1) * 3) / 2;
+            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, std::max<uint32_t>(grown, 2048));
         }
 
         if (createSet || (descriptorTextureReplacementMapEnabled != textureCacheReplacementMapEnabled)) {
@@ -1182,6 +1309,18 @@ namespace RT64 {
             dummyDepthTargetTransitioned = true;
         }
 
+        // Pokemon Snap port: the fallback texel's one upload (resetFramebuffers
+        // made the texture and the zeroed buffer), then shader-read for good.
+        // The row is padded to the copy pitch the way the texture cache pads
+        // its uploads (TextureDataPitchAlignment, 256 bytes = 64 texels).
+        if ((snapFallbackTexture != nullptr) && !snapFallbackUploaded) {
+            worker->commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(snapFallbackTexture.get(), RenderTextureLayout::COPY_DEST));
+            worker->commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(snapFallbackTexture.get()),
+                RenderTextureCopyLocation::PlacedFootprint(snapFallbackUpload.get(), RenderFormat::R8G8B8A8_UNORM, 1, 1, 1, 64));
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS_AND_COMPUTE, RenderTextureBarrier(snapFallbackTexture.get(), RenderTextureLayout::SHADER_READ));
+            snapFallbackUploaded = true;
+        }
+
         for (BufferUploader *uploader : bufferUploaders) {
             uploader->commandListBeforeBarriers(worker);
         }
@@ -1325,6 +1464,7 @@ namespace RT64 {
         fbParams.resolution = { p.targetWidth / p.resolutionScale.x, p.targetHeight / p.resolutionScale.y };
         fbParams.resolutionScale = p.resolutionScale;
         fbParams.horizontalMisalignment = p.horizontalMisalignment;
+        fbParams.snapPrimWeight = p.snapRectWeight;
         framebufferCount++;
 
         while (framebufferCount > framebufferVector.size()) {
@@ -1486,11 +1626,34 @@ namespace RT64 {
             const uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
             if (proj.usesViewport()) {
                 // The call's scissor spans the whole width of the framebuffer pair scissor. Custom origin must not be in use to be able to use the stretched viewport.
-                const auto &viewport = drawData.rspViewports[proj.transformsIndex];
+                // Pokemon Snap port: read the viewport as blended for this
+                // sub-frame, so the clip derived from it moves with the scene
+                // instead of cropping the blended picture at the stepped edge.
+                const auto &viewport = (proj.transformsIndex < drawData.modRspViewports.size()) ?
+                    drawData.modRspViewports[proj.transformsIndex] : drawData.rspViewports[proj.transformsIndex];
                 FixedRect intersectionRect = proj.scissorRect.intersection(viewport.rect(viewportClipRatios));
                 bool coversWholeWidth = !intersectionRect.isEmpty() && (intersectionRect.ulx <= fbPair.scissorRect.ulx) && (intersectionRect.lrx >= fbPair.scissorRect.lrx);
                 bool horizontalRatio = !intersectionRect.isEmpty() && (intersectionRect.width(true, true) > intersectionRect.height(true, true));
                 bool useWideViewport = (viewportOrigin == G_EX_ORIGIN_NONE) && coversWholeWidth && horizontalRatio;
+                // Pokemon Snap port, diagnostic (SNAP_WIDE_DIAG): the inputs
+                // of this decision, for a sample of projections.
+                {
+                    static const bool snapWideDiag = (getenv("SNAP_WIDE_DIAG") != nullptr);
+                    static uint32_t snapWideSeen = 0;
+                    if (snapWideDiag && ((snapWideSeen++ % 3000) < 40)) {
+                        const FixedRect vpRect = viewport.rect(viewportClipRatios);
+                        const auto &steppedVp = drawData.rspViewports[proj.transformsIndex];
+                        const FixedRect steppedRect = steppedVp.rect(viewportClipRatios);
+                        fprintf(stdout, "[SNAP-WIDE] proj t%u calls %u vp %d,%d-%d,%d (stepped %d,%d-%d,%d) sc %d,%d-%d,%d fb %d,%d-%d,%d ratios %d,%d,%d,%d origin %u covers %d horiz %d WIDE %d\n",
+                            proj.transformsIndex, proj.gameCallCount,
+                            vpRect.ulx / 4, vpRect.uly / 4, vpRect.lrx / 4, vpRect.lry / 4,
+                            steppedRect.ulx / 4, steppedRect.uly / 4, steppedRect.lrx / 4, steppedRect.lry / 4,
+                            proj.scissorRect.ulx / 4, proj.scissorRect.uly / 4, proj.scissorRect.lrx / 4, proj.scissorRect.lry / 4,
+                            fbPair.scissorRect.ulx / 4, fbPair.scissorRect.uly / 4, fbPair.scissorRect.lrx / 4, fbPair.scissorRect.lry / 4,
+                            viewportClipRatios[0], viewportClipRatios[1], viewportClipRatios[2], viewportClipRatios[3],
+                            unsigned(viewportOrigin), int(coversWholeWidth), int(horizontalRatio), int(useWideViewport));
+                    }
+                }
                 if (useWideViewport) {
                     projInvRatioScale = 1.0f;
                 }
@@ -1506,6 +1669,41 @@ namespace RT64 {
                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
             }
 
+            // Pokemon Snap port: a scissor narrower than the projection's own
+            // viewport is a crop the game authored in its picture's pixels --
+            // the viewfinder's letterbox, viewport -20..340 against a scissor
+            // of 30..290. The scene inside is widened like the rest of the
+            // course, but the crop keeps its place: converted at the 4:3
+            // picture's scale about the centre, not stretched with the target,
+            // which had opened it to the wide edges and let the world into
+            // what the console shows black beside the film counter. A scissor
+            // that matches its viewport (the course itself, the photo renders)
+            // is stretched as before.
+            bool snapCropScissor = false;
+            if (proj.usesViewport() && (projInvRatioScale == 1.0f) && (proj.transformsIndex < drawData.rspViewports.size())) {
+                const FixedRect vpRect = drawData.rspViewports[proj.transformsIndex].rect(viewportClipRatios);
+                snapCropScissor = !proj.scissorRect.isNull() && (vpRect.ulx < proj.scissorRect.ulx) && (vpRect.lrx > proj.scissorRect.lrx);
+            }
+            const float snapCropInvRatioScale = (p.aspectRatioTarget > 0.0f) ? (p.aspectRatioSource / p.aspectRatioTarget) : 1.0f;
+
+            // Pokemon Snap port, diagnostic (SNAP_DRAW_TRACE=<game frame>): the
+            // projections and draw calls of the frames around that one, with
+            // the scissor and viewport clip this renderer computed for each,
+            // on whichever thread renders them (the resolution scale tells
+            // the native pass from the scaled one). Two machines running the
+            // same replay print the same frames; a diff of the lines names
+            // the draw that differs. For the Deck's top-left chunk
+            // (2026-09-12).
+            const bool snapDrawTrace = snapDrawTraceActive();
+            if (snapDrawTrace) {
+                snapDrawTraceLine("proj %u pair %u type %d calls %u scissor (%d,%d)-(%d,%d) usesViewport %d viewportClip (%.1f,%.1f %.1fx%.1f) projInvRatioScale %.4f cropScissor %d res %.3fx%.3f fb %ux%u",
+                    pr, p.fbPairIndex, int(proj.type), proj.gameCallCount,
+                    proj.scissorRect.isNull() ? -1 : (proj.scissorRect.ulx >> 2), proj.scissorRect.isNull() ? -1 : (proj.scissorRect.uly >> 2),
+                    proj.scissorRect.isNull() ? -1 : (proj.scissorRect.lrx >> 2), proj.scissorRect.isNull() ? -1 : (proj.scissorRect.lry >> 2),
+                    proj.usesViewport() ? 1 : 0, viewportClip.x, viewportClip.y, viewportClip.width, viewportClip.height,
+                    projInvRatioScale, snapCropScissor ? 1 : 0, float(p.resolutionScale.x), float(p.resolutionScale.y), p.fbWidth, p.fbHeight);
+            }
+
             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                 const GameCall &call = proj.gameCalls[d];
                 renderIndices.instanceIndex = call.callDesc.callIndex;
@@ -1514,6 +1712,11 @@ namespace RT64 {
                 renderIndices.rdpTileCount = call.callDesc.tileCount;
                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
                 renderIndicesVector.push_back(renderIndices);
+
+                // Set when a rectangle is uncovering rather than moving; the clip
+                // below is narrowed to it so the reveal runs at the display's rate.
+                FixedRect snapRevealRect;
+                snapRevealRect.reset();
 
                 uint32_t cycleType = call.callDesc.otherMode.cycleType();
                 if (cycleType == G_CYC_FILL) {
@@ -1616,7 +1819,7 @@ namespace RT64 {
                             triangles.pipeline = rasterShaderUber->getPipeline(
                                 !copyMode && call.shaderDesc.otherMode.zCmp() && (call.shaderDesc.otherMode.zMode() != ZMODE_DEC),
                                 !copyMode && call.shaderDesc.otherMode.zUpd(),
-                                (call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE));
+                                !copyMode && ((call.shaderDesc.otherMode.cvgDst() == CVG_DST_WRAP) || (call.shaderDesc.otherMode.cvgDst() == CVG_DST_SAVE)));
                         }
                         
                         triangles.faceCount = call.callDesc.triangleCount;
@@ -1630,7 +1833,7 @@ namespace RT64 {
                         case Projection::Type::Orthographic: {
                             instanceDrawCall.type = InstanceDrawCall::Type::IndexedTriangles;
                             triangles.indexStart = triangles.vertexTestZ ? vertexTestZFaceIndicesStart : call.meshDesc.faceIndicesStart;
-                            invRatioScale = projInvRatioScale;
+                            invRatioScale = snapCropScissor ? snapCropInvRatioScale : projInvRatioScale;
                             break;
                         }
                         case Projection::Type::Rectangle: {
@@ -1652,7 +1855,224 @@ namespace RT64 {
                                 horizontalMisalignment = p.horizontalMisalignment;
                             }
 
-                            RenderViewport viewportRect = convertViewportRect(call.callDesc.rect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                            // Pokemon Snap port: a tagged rectangle is drawn
+                            // between where its element was on the previous
+                            // drawn frame and where it is on this one, so 2D
+                            // content moves at the display's rate like
+                            // everything else rather than stepping at the
+                            // game's. Only the position moves; which rectangle
+                            // this is, what it samples and how it blends are
+                            // all still exactly what the game asked for. An
+                            // untagged or unmatched rectangle keeps the
+                            // authored coordinates untouched.
+                            //
+                            // The aspect decision above deliberately reads the
+                            // authored rectangle instead: it is a yes or no
+                            // about covering the scissor, and letting a moving
+                            // edge flip it would make the whole rectangle
+                            // change shape part way through a tick.
+                            // A rectangle either MOVES or UNCOVERS, and the
+                            // two want opposite handling.
+                            //
+                            // Where its texels land is a function of its own
+                            // width and height, fixed when the display list was
+                            // built -- RDP::drawRect derives the far texture
+                            // coordinates as uls + dsdx * width and
+                            // ult + dtdy * height -- and the geometry is a
+                            // static quad the viewport scales. So a rectangle
+                            // drawn at a size between two frames maps its whole
+                            // picture into that size and squashes it.
+                            //
+                            // A rectangle that kept its size is moving, and
+                            // moving the viewport is exactly right.
+                            //
+                            // A rectangle that grew while its texel rate held
+                            // still is neither moving nor being rescaled: it is
+                            // uncovering more of a picture drawn at a fixed rate
+                            // per pixel. That is how both the panel that slides
+                            // out from the left edge and the course preview that
+                            // rolls down are built -- their origins never move,
+                            // which is why moving them achieved nothing at all.
+                            // For those the picture is drawn at the size the game
+                            // asked for, so it cannot distort, and the CLIP is
+                            // taken to the blended size instead. The rows that
+                            // show are the same rows the game would have drawn at
+                            // that height, so it uncovers at the display's rate
+                            // rather than in steps.
+                            //
+                            // A rectangle whose texel rate also changed is being
+                            // genuinely rescaled. Blending that needs the texture
+                            // coordinates blended with it, and those live in
+                            // vertex data shared by every image between two
+                            // frames, so it is drawn exactly as authored.
+                            FixedRect drawnRect = call.callDesc.rect;
+                            if (snapdiag::statsEnabled() && call.callDesc.snapRectMapped) {
+                                snapdiag::rectDrawMarkedCounter().fetch_add(1, std::memory_order_relaxed);
+                                if (!(p.snapRectWeight < 1.0f)) {
+                                    snapdiag::rectDrawWeightOneCounter().fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+
+                            if (call.callDesc.snapRectMapped && (p.snapRectWeight < 1.0f) &&
+                                snapdiag::rectInterpolationEnabled().load(std::memory_order_relaxed)) {
+                                const FixedRect &prevRect = call.callDesc.snapPrevRect;
+                                const float w = p.snapRectWeight;
+                                auto lerpCoord = [w](int32_t prev, int32_t cur) {
+                                    return int32_t(std::lround(float(prev) + (float(cur) - float(prev)) * w));
+                                };
+
+                                FixedRect blended;
+                                blended.ulx = lerpCoord(prevRect.ulx, drawnRect.ulx);
+                                blended.uly = lerpCoord(prevRect.uly, drawnRect.uly);
+                                blended.lrx = lerpCoord(prevRect.lrx, drawnRect.lrx);
+                                blended.lry = lerpCoord(prevRect.lry, drawnRect.lry);
+
+                                const bool sameSize =
+                                    ((drawnRect.lrx - drawnRect.ulx) == (prevRect.lrx - prevRect.ulx)) &&
+                                    ((drawnRect.lry - drawnRect.uly) == (prevRect.lry - prevRect.uly));
+                                const bool sameRate =
+                                    (call.callDesc.rectDsdx == call.callDesc.snapPrevDsdx) &&
+                                    (call.callDesc.rectDtdy == call.callDesc.snapPrevDtdy);
+
+                                // Uncovering is the one case the viewport must
+                                // not follow. Everything else it must.
+                                //
+                                // A rectangle that kept its size is moving, so
+                                // the viewport moves with it.
+                                //
+                                // A rectangle whose texel rate CHANGED with its
+                                // size is being scaled, not uncovered: the rate
+                                // moves inversely to the size precisely so the
+                                // whole picture keeps fitting, which means the
+                                // far texture coordinate lands in the same place
+                                // whatever the size and the picture is meant to
+                                // squash. Blending the viewport is then exactly
+                                // right, and refusing to -- as this did for one
+                                // build -- left the course preview stepping on
+                                // the way back up while it uncovered smoothly on
+                                // the way down.
+                                //
+                                // Only a rectangle that grew or shrank at a
+                                // FIXED rate is uncovering, because there the
+                                // far coordinate moves with the size and the
+                                // picture is drawn at a constant scale. That one
+                                // keeps its authored size and has its clip
+                                // blended instead.
+                                // Uncovering keeps an EDGE PINNED. A panel
+                                // unrolls from somewhere: the course preview
+                                // holds its top and grows downwards, the
+                                // interface panel holds an edge and grows
+                                // sideways. Something that grows on all four
+                                // sides at once is not being uncovered, it is
+                                // getting bigger.
+                                //
+                                // Without this the clip was applied to anything
+                                // that grew, which includes every effect sprite
+                                // in the game that spawns small and swells --
+                                // the sand under Doduo, the leaves out of the
+                                // grass. Those were clipped down to their
+                                // BLENDED size, so at the start of each interval
+                                // barely any of the sprite survived the clip and
+                                // it filled in as the weight advanced. It read
+                                // as effects vanishing and popping back, which
+                                // is what was reported, and it was this.
+                                // Uncovering changes EXACTLY ONE edge. The
+                                // course preview rolls its bottom edge down
+                                // with top, left and right fixed; the panel
+                                // slides one edge out the same way. Every
+                                // genuine reveal in the logs has this shape --
+                                // 3x32 at (317,172) becoming 4x32 at (316,172)
+                                // moves the left edge and nothing else.
+                                //
+                                // Requiring only SOME edge to hold still let a
+                                // tumbling effect sprite in, whenever one of
+                                // its edges happened to land where it was and
+                                // its texel rate quantised equal -- the game
+                                // recomputes that rate from the on-screen size
+                                // every frame, so near-equal sizes produce
+                                // equal rates. Treated as a reveal, the sprite
+                                // was clipped to the blended rectangle and
+                                // drawn with chunks missing, which garbled the
+                                // leaves whenever the view swung. One moved
+                                // edge is the shape of an unrolling panel;
+                                // nothing that tumbles has it.
+                                const uint32_t movedEdges =
+                                    uint32_t(prevRect.ulx != drawnRect.ulx) +
+                                    uint32_t(prevRect.uly != drawnRect.uly) +
+                                    uint32_t(prevRect.lrx != drawnRect.lrx) +
+                                    uint32_t(prevRect.lry != drawnRect.lry);
+                                // The whole reveal-versus-rescale question is
+                                // about where TEXELS land, and a fill rectangle
+                                // has none: it is one solid colour at any size,
+                                // so blending its rectangle is always right.
+                                // Left to the reveal test, the viewfinder's
+                                // black bands matched it exactly on the way out
+                                // -- one moved edge, no texel rate -- and the
+                                // clip-blend can only ever CUT a rectangle
+                                // down, so a band grew smoothly and retracted
+                                // in the game's own steps.
+                                const bool fillCycle =
+                                    (call.shaderDesc.otherMode.cycleType() == G_CYC_FILL);
+                                const bool uncovering = !fillCycle && !sameSize && sameRate && (movedEdges == 1);
+                                if (uncovering) {
+                                    if (!blended.isEmpty()) {
+                                        snapRevealRect = blended;
+                                        if (snapdiag::statsEnabled()) {
+                                            snapdiag::rectsRevealedCounter().fetch_add(1, std::memory_order_relaxed);
+                                        }
+                                    }
+                                }
+                                else {
+                                    drawnRect = blended;
+                                    if (snapdiag::statsEnabled()) {
+                                        snapdiag::rectsLerpedCounter().fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                }
+                            }
+
+                            // One line per named sprite-sized rectangle per
+                            // sub-frame while the capture window is open: the
+                            // weight it was placed at and the endpoints it was
+                            // placed between. The captured pictures say what a
+                            // smear looks like; these lines say which lerp put
+                            // each rectangle there.
+                            if (snap_frame_dump_pending.load(std::memory_order_relaxed) > 0) {
+                                const uint32_t sid = call.callDesc.snapRectId;
+                                const int32_t sw = (call.callDesc.rect.lrx - call.callDesc.rect.ulx) >> 2;
+                                const int32_t sh = (call.callDesc.rect.lry - call.callDesc.rect.uly) >> 2;
+                                if ((sid != 0) && (sw >= 4) && (sw <= 150) && (sh >= 4) && (sh <= 150)) {
+                                    fprintf(stdout, "[SNAP-RDRAW] f%u id %08X ord %u w %.3f auth (%d,%d %dx%d) prev (%d,%d %dx%d) drawn (%d,%d %dx%d) mapped %d\n",
+                                        p.fbPairIndex, sid, call.callDesc.snapRectOrdinal, p.snapRectWeight,
+                                        call.callDesc.rect.ulx >> 2, call.callDesc.rect.uly >> 2, sw, sh,
+                                        call.callDesc.snapPrevRect.ulx >> 2, call.callDesc.snapPrevRect.uly >> 2,
+                                        (call.callDesc.snapPrevRect.lrx - call.callDesc.snapPrevRect.ulx) >> 2,
+                                        (call.callDesc.snapPrevRect.lry - call.callDesc.snapPrevRect.uly) >> 2,
+                                        drawnRect.ulx >> 2, drawnRect.uly >> 2,
+                                        (drawnRect.lrx - drawnRect.ulx) >> 2, (drawnRect.lry - drawnRect.uly) >> 2,
+                                        int(call.callDesc.snapRectMapped));
+                                }
+                            }
+
+                            RenderViewport viewportRect = convertViewportRect(drawnRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, horizontalMisalignment, call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                            // Pokemon Snap port, diagnostic (SNAP_PASS_TRACE): every
+                            // rectangle drawn by a pass whose colour image is at
+                            // most sixteen pixels wide -- the game's photo
+                            // detector copies a 7x7 tile into 8-wide buffers --
+                            // with the numbers that place it, for the Deck's
+                            // top-left box (2026-09-12).
+                            {
+                                static const bool passTrace = (std::getenv("SNAP_PASS_TRACE") != nullptr);
+                                static uint32_t passTraceLines = 0;
+                                if (passTrace && (p.fbWidth <= 16) && (passTraceLines < 400)) {
+                                    passTraceLines++;
+                                    fprintf(stdout, "[SNAP-PASS] rect: pair %u fbWidth %u fbHeight %u target %ux%u res %.2f ext %.3f misalign %.1f rect (%d,%d %dx%d) -> viewport (%.1f,%.1f %.1fx%.1f) pass viewport (%.1f,%.1f %.1fx%.1f)\n",
+                                        p.fbPairIndex, p.fbWidth, p.fbHeight, p.targetWidth, p.targetHeight, float(p.resolutionScale.x), extOriginPercentage, horizontalMisalignment,
+                                        drawnRect.ulx >> 2, drawnRect.uly >> 2, (drawnRect.lrx - drawnRect.ulx) >> 2, (drawnRect.lry - drawnRect.uly) >> 2,
+                                        viewportRect.x, viewportRect.y, viewportRect.width, viewportRect.height,
+                                        framebuffer.viewport.x, framebuffer.viewport.y, framebuffer.viewport.width, framebuffer.viewport.height);
+                                    fflush(stdout);
+                                }
+                            }
                             triangles.screenScale = { viewportRect.width / framebuffer.viewport.width, viewportRect.height / framebuffer.viewport.height };
                             triangles.screenOffset.x = halfPixelOffset.x + ((viewportRect.x + viewportRect.width / 2.0f) - halfViewportSize.x) / halfViewportSize.x;
                             triangles.screenOffset.y = halfPixelOffset.y + (halfViewportSize.y - (viewportRect.y + viewportRect.height / 2.0f)) / halfViewportSize.y;
@@ -1676,11 +2096,59 @@ namespace RT64 {
                             break;
                         }
 
-                        triangles.scissor = convertFixedRect(call.callDesc.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
+                        // Pokemon Snap port: a call clipped by the projection's
+                        // own animated scissor is clipped by the blended one on
+                        // sub-frames where the view interpolated, so the crop
+                        // edge moves with the scene it crops instead of
+                        // stepping at the game's rate. A call with its own
+                        // narrower scissor keeps it untouched.
+                        const FixedRect &callRect = call.callDesc.scissorRect;
+                        const bool callUsesProjScissor = proj.snapScissorBlended &&
+                            (callRect.ulx == proj.scissorRect.ulx) && (callRect.uly == proj.scissorRect.uly) &&
+                            (callRect.lrx == proj.scissorRect.lrx) && (callRect.lry == proj.scissorRect.lry);
+                        const FixedRect &callScissor = callUsesProjScissor ? proj.snapBlendedScissor : callRect;
+
+                        // Pokemon Snap port: a rectangle keeps its place in
+                        // the 4:3 picture, but its scissor need not keep the
+                        // 4:3 width. When the game's scissor spans its whole
+                        // picture, the picture it means is the widened one:
+                        // converted with the rectangle's own factor it landed
+                        // on the 4:3 area and cut every rectangle at that
+                        // edge, so the effect drawer's particles -- whose own
+                        // test is widened for the margins -- vanished there
+                        // whatever the game drew. A scissor narrower than
+                        // the picture is a crop and stays where the game put it.
+                        float scissorInvRatioScale = invRatioScale;
+                        if ((proj.type == Projection::Type::Rectangle) && (callScissor.ulx <= 0) && (callScissor.lrx >= int32_t(p.fbWidth) * 4)) {
+                            scissorInvRatioScale = 1.0f;
+                        }
+
+                        triangles.scissor = convertFixedRect(callScissor, p.resolutionScale, p.fbWidth, scissorInvRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
+
+                        // Narrowed to the part of an uncovering rectangle that
+                        // has been revealed so far. The picture is drawn at the
+                        // size the game asked for, so nothing is stretched; only
+                        // how much of it shows is blended.
+                        if (!snapRevealRect.isNull()) {
+                            const RenderRect revealed = convertFixedRect(snapRevealRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                            triangles.scissor.left = std::max(triangles.scissor.left, revealed.left);
+                            triangles.scissor.top = std::max(triangles.scissor.top, revealed.top);
+                            triangles.scissor.right = std::max(triangles.scissor.left, std::min(triangles.scissor.right, revealed.right));
+                            triangles.scissor.bottom = std::max(triangles.scissor.top, std::min(triangles.scissor.bottom, revealed.bottom));
+                        }
 
                         bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
                         if (usesViewport) {
                             triangles.scissor = viewportScissorIntersection(viewportClip, triangles.scissor);
+                        }
+                        if (snapDrawTrace) {
+                            snapDrawTraceLine("  call %u type %d tris %u scissor (%d,%d)-(%d,%d) callRect (%d,%d)-(%d,%d) origins %u/%u testZ %d indexStart %u rect (%d,%d)-(%d,%d)",
+                                d, int(instanceDrawCall.type), call.callDesc.triangleCount,
+                                triangles.scissor.left, triangles.scissor.top, triangles.scissor.right, triangles.scissor.bottom,
+                                callScissor.isNull() ? -1 : (callScissor.ulx >> 2), callScissor.isNull() ? -1 : (callScissor.uly >> 2),
+                                callScissor.isNull() ? -1 : (callScissor.lrx >> 2), callScissor.isNull() ? -1 : (callScissor.lry >> 2),
+                                call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin, triangles.vertexTestZ ? 1 : 0, triangles.indexStart,
+                                call.callDesc.rect.ulx >> 2, call.callDesc.rect.uly >> 2, call.callDesc.rect.lrx >> 2, call.callDesc.rect.lry >> 2);
                         }
                         
                         if (triangles.vertexTestZ && usesViewport) {

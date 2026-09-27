@@ -2,12 +2,27 @@
 // RT64
 //
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
 #include "common/rt64_math.h"
 
 #include "rt64_game_frame.h"
+#include "rt64_snap_diag.h"
 #include "rt64_workload_queue.h"
 
+#include <cstdio>
+
 #include "xxHash/xxh3.h"
+
+// Pokemon Snap port: the presented-frame capture window (rt64_present_queue.cpp).
+// While a burst of presents is being photographed, the rectangle matcher below
+// prints every decision it makes, so the pictures and the pairs that produced
+// them are two views of the same moment.
+extern "C" std::atomic<int32_t> snap_frame_dump_pending;
 
 namespace RT64 {
     // GameFrame
@@ -247,15 +262,47 @@ namespace RT64 {
         prevScreenPos = (fabs(prevScreenPos.w) < 1e-6f) ? prevScreenPos : prevScreenPos / prevScreenPos.w;
         curScreenPos = (fabs(curScreenPos.w) < 1e-6f) ? curScreenPos : curScreenPos / curScreenPos.w;
         matchResult.screenSpaceDifference = hlslpp::length(curScreenPos.xyz - prevScreenPos.xyz);
-        
+
         matchResult.valid = true;
         return matchResult;
     }
+
 
     void GameFrame::match(RenderWorker *worker, WorkloadQueue &workloadQueue, const GameFrame &prevFrame, BufferUploader *velocityUploader, bool &velocityUploaderUsed, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
         tileInterpolationUsed = false;
         lookAtInterpolationUsed = false;
         matched = true;
+
+        // Pokemon Snap port: the game moves its world origin as the rail crosses
+        // between blocks. enterNextBlock translates the camera and everything in
+        // the world by the difference between the two blocks' positions, which is
+        // a couple of thousand units across a corner. Both frames are correct and
+        // describe the same scene; they are measured about different origins, so
+        // there is no motion between them to interpolate.
+        //
+        // With the distance recorded here, the previous frame's transforms and
+        // view can be read in the new origin, so everything that survived the
+        // transition interpolates as it does on any other frame. The camera is
+        // tagged with its own matrix group (src/matrix_tags.cpp), whose skip
+        // components already snap the view on the frame the game's camera data
+        // jumped -- which a rebase always is -- so nothing here decides cuts.
+        snapRebaseFrame = false;
+        snapOriginDelta = hlslpp::float3(0.0f, 0.0f, 0.0f);
+        for (uint32_t w : workloads) {
+            Workload &rebaseWorkload = workloadQueue.workloads[w];
+            if (rebaseWorkload.snapOriginRebased) {
+                rebaseWorkload.snapOriginRebased = false;
+                snapRebaseFrame = true;
+                snapOriginDelta = rebaseWorkload.snapOriginDelta;
+            }
+        }
+
+        // With the distance known, the previous frame can be moved into this
+        // frame's origin instead of being held: expressed the same way, the two
+        // differ only by whatever genuinely moved, and everything interpolates
+        // as it does on any other frame. Each candidate is checked individually
+        // and only taken when it lands nearer than the unmoved one, so a delta
+        // that is wrong, stale, or absent simply is not used.
 
         thread_local std::unordered_map<uint32_t, ModifiedBuffers> workloadsModified;
         workloadsModified.clear();
@@ -280,6 +327,14 @@ namespace RT64 {
             workloadMap.tiles.resize(curWorkload.drawData.rdpTiles.size());
             workloadMap.lookAt.clear();
             workloadMap.lookAt.resize(curWorkload.drawData.rspLookAt.size());
+
+            // Rectangles are matched by the name the game gave them rather
+            // than through the scene maps, because a rectangle never enters a
+            // scene: GameFrame::set admits only perspective and orthographic
+            // projections, so nothing below this ever sees one.
+            if (snapMatchRects(curWorkload, prevWorkload)) {
+                workloadsModified[workloads[w]].rdpParams = true;
+            }
             workloadMap.prevTransformsMapped.clear();
             workloadMap.prevTransformsMapped.resize(prevWorkload.drawData.worldTransforms.size());
             workloadMap.prevTilesMapped.clear();
@@ -309,7 +364,7 @@ namespace RT64 {
                     prevIt++;
                 }
                 else {
-                    matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
+                    matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers, true);
                     curIt++;
                     prevIt++;
                 }
@@ -319,6 +374,39 @@ namespace RT64 {
                 workloadsModified[workloads[w]].merge(modifiedBuffers);
             }
 
+            if (snapdiag::statsEnabled()) {
+                // Every matrix the previous frame drew with, so an unpaired one
+                // can be asked whether it actually went anywhere.
+                thread_local std::unordered_set<uint64_t> prevMatrices;
+                prevMatrices.clear();
+                for (const auto &m : prevWorkload.drawData.worldTransforms) {
+                    prevMatrices.insert(XXH3_64bits(&m, sizeof(m)));
+                }
+
+                uint32_t seen = 0, paired = 0;
+                for (size_t ti = 0; ti < curWorkloadMap.transforms.size(); ti++) {
+                    const auto &tm = curWorkloadMap.transforms[ti];
+                    seen++;
+                    if (tm.mapped) {
+                        paired++;
+                    }
+                    else if (ti < curWorkload.drawData.worldTransforms.size()) {
+                        const auto &m = curWorkload.drawData.worldTransforms[ti];
+                        if (prevMatrices.find(XXH3_64bits(&m, sizeof(m))) != prevMatrices.end()) {
+                            snapdiag::transformsUnpairedStillCounter().fetch_add(1, std::memory_order_relaxed);
+                        }
+                        else {
+                            snapdiag::transformsUnpairedMovedCounter().fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                snapdiag::transformsSeenCounter().fetch_add(seen, std::memory_order_relaxed);
+                snapdiag::transformsPairedCounter().fetch_add(paired, std::memory_order_relaxed);
+                snapdiag::transformsTaggedCounter().fetch_add(uint32_t(curWorkload.transformIdMap.size()), std::memory_order_relaxed);
+                snapdiag::transformsIgnoredCounter().fetch_add(uint32_t(curWorkload.transformIgnoredIds.size()), std::memory_order_relaxed);
+            }
+
             // Any transforms tagged with the empty ID will be instantly marked as used and skipped.
             for (uint32_t curIt : curWorkload.transformIgnoredIds) {
                 GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curIt];
@@ -326,6 +414,7 @@ namespace RT64 {
                 curTransformMap.prevTransformIndex = 0;
                 curTransformMap.mapped = false;
             }
+
         }
 
         thread_local std::vector<MatchCandidate> matchCandidates;
@@ -375,6 +464,26 @@ namespace RT64 {
         matchScenes(perspectiveScenes, prevFrame.perspectiveScenes);
         matchScenes(orthographicScenes, prevFrame.orthographicScenes);
 
+        // Pokemon Snap port: colours the game steps once per frame are blended
+        // by the shader between the matched frames. After the scenes, so the
+        // transform verdicts this reads are the final ones.
+        for (uint32_t w = 0; w < workloads.size(); w++) {
+            if (w >= prevFrame.workloads.size()) {
+                continue;
+            }
+
+            const GameFrameMap::WorkloadMap &workloadMap = frameMap.workloads[workloads[w]];
+            if (!workloadMap.mapped) {
+                continue;
+            }
+
+            Workload &curWorkload = workloadQueue.workloads[workloads[w]];
+            const Workload &prevWorkload = workloadQueue.workloads[workloadMap.prevWorkloadIndex];
+            if (snapMatchPrimColors(curWorkload, prevWorkload, workloadMap)) {
+                workloadsModified[workloads[w]].rdpParams = true;
+            }
+        }
+
         if (!workloadsModified.empty()) {
             thread_local std::vector<BufferUploader::Upload> uploads;
             uploads.clear();
@@ -388,6 +497,13 @@ namespace RT64 {
                 if (it.second.texcoordVelocity) {
                     uploads.emplace_back(BufferUploader::Upload{ workload.drawData.tcVelFloats.data(), { 0, workload.drawData.tcVelFloats.size() }, sizeof(float), RenderBufferFlag::FORMATTED, { RenderFormat::R32_FLOAT }, &workload.drawBuffers.texcoordVelocityBuffer });
                 }
+
+                // Pokemon Snap port: the RDP parameters went up when the frame
+                // was submitted, before any matching; a previous primitive
+                // colour noted since has to go up again.
+                if (it.second.rdpParams) {
+                    uploads.emplace_back(BufferUploader::Upload{ workload.drawData.rdpParams.data(), { 0, workload.drawData.rdpParams.size() }, sizeof(interop::RDPParams), RenderBufferFlag::STORAGE, { }, &workload.drawBuffers.rdpParamsBuffer });
+                }
             }
 
             velocityUploader->submit(worker, uploads);
@@ -396,6 +512,172 @@ namespace RT64 {
         else {
             velocityUploaderUsed = false;
         }
+
+        // Pokemon Snap port: an object is judged as an object. The automatic
+        // pose guard judges each matrix alone, on its own velocity, and a
+        // model's matrices never move alike -- a limb swinging up from rest
+        // crosses the guard's threshold on a tick the torso carrying it does
+        // not. The guard then snaps that one matrix to its new pose while the
+        // rest of the model blends towards it, and the model comes apart for
+        // the frame: the camera prop rising out of Todd's hand, a walking
+        // model ghosting against itself. Measured, this is the common case,
+        // not the rare one -- a handful of matrices out of a hundred and
+        // fifty, several times a second.
+        //
+        // A matrix cannot be judged alone because it is not alone: it is one
+        // joint of one object, and the object either jumped or it did not.
+        // The game names the object each matrix belongs to
+        // (patches/src/render_patch.c) and the verdict is taken across it:
+        // when most of an object's matrices call it a teleport the object
+        // really did move somewhere else and all of it snaps, and when only a
+        // few do they are the guard misreading fast animation, so all of it
+        // blends. Either way every part of the object agrees, which is the
+        // only way it can look like one object.
+        {
+            struct CoherenceTally {
+                uint32_t total = 0;
+                uint32_t rejected = 0;
+                bool snap = false;
+            };
+            thread_local std::unordered_map<uint32_t, CoherenceTally> coherenceTallies;
+            for (uint32_t w : workloads) {
+                Workload &workload = workloadQueue.workloads[w];
+                GameFrameMap::WorkloadMap &wm = frameMap.workloads[w];
+                if (!wm.mapped) {
+                    continue;
+                }
+                const auto &groupIndices = workload.drawData.worldTransformGroups;
+                const size_t transformCount = std::min(wm.transforms.size(), groupIndices.size());
+                coherenceTallies.clear();
+                for (size_t t = 0; t < transformCount; t++) {
+                    const uint32_t coherenceId = workload.drawData.transformGroups[groupIndices[t]].coherenceId;
+                    const GameFrameMap::TransformMap &tm = wm.transforms[t];
+                    if ((coherenceId == 0) || !tm.mapped) {
+                        continue;
+                    }
+                    CoherenceTally &tally = coherenceTallies[coherenceId];
+                    tally.total++;
+                    if (tm.rigidBody.autoRejectedTranslation) {
+                        tally.rejected++;
+                    }
+                }
+                uint32_t snappedObjects = 0, freedObjects = 0, freedMatrices = 0;
+                float coherenceLiftedWorst = 0.0f;
+                // An object the game's own animation says stepped to this pose
+                // snaps whole, whatever the distance. The three defences below
+                // all ask how MUCH moved, and a step can be small: the camera
+                // in Todd's hand moves two and a half units and is unmistakable
+                // because it leaves his hand. Magnitude was never the question;
+                // the game already knows the answer and says so in the display
+                // list.
+                uint32_t steppedMatched = 0;
+                for (auto &it : coherenceTallies) {
+                    if (workload.snapHasSteppedId(it.first)) {
+                        it.second.rejected = it.second.total;
+                        steppedMatched++;
+                    }
+                }
+                if ((workload.snapSteppedIdCount > 0) && (steppedMatched == 0) &&
+                    (snapdiag::diagEnabled() || snapdiag::statsEnabled())) {
+                    // The game named an object that stepped and the renderer is
+                    // tracking no transform belonging to it. The verdict is
+                    // correct and lands on nothing, which is worth saying out
+                    // loud rather than looking like a fix that works.
+                    fprintf(stdout, "[SNAP-STEP] verdict for %u object(s) matched no tracked transform (%u groups tracked)\n",
+                        workload.snapSteppedIdCount, uint32_t(coherenceTallies.size()));
+                    fflush(stdout);
+                }
+                for (auto &it : coherenceTallies) {
+                    // The line sits high on purpose. A world transform is
+                    // composed down the object's hierarchy, so an object that
+                    // truly moved elsewhere carries the jump into every matrix
+                    // beneath the one that moved -- a real teleport rejects
+                    // nearly all of them, and the measured staging ticks do
+                    // (a hundred and twenty to a hundred and seventy of a
+                    // hundred and fifty). Anything short of that is the guard
+                    // misreading animation, and snapping a whole object on a
+                    // minority of votes would step objects that never moved.
+                    it.second.snap = (it.second.rejected * 4) >= (it.second.total * 3);
+                    if (it.second.rejected == 0) {
+                        continue;
+                    }
+                    if (it.second.snap) {
+                        snappedObjects++;
+                    }
+                    else {
+                        freedObjects++;
+                        freedMatrices += it.second.rejected;
+                    }
+                }
+                if ((snappedObjects == 0) && (freedObjects == 0)) {
+                    continue;
+                }
+                for (size_t t = 0; t < transformCount; t++) {
+                    const uint32_t curGroupIndex = groupIndices[t];
+                    const TransformGroup &curGroup = workload.drawData.transformGroups[curGroupIndex];
+                    if (curGroup.coherenceId == 0) {
+                        continue;
+                    }
+                    GameFrameMap::TransformMap &tm = wm.transforms[t];
+                    if (!tm.mapped) {
+                        continue;
+                    }
+                    const auto tallyIt = coherenceTallies.find(curGroup.coherenceId);
+                    if (tallyIt == coherenceTallies.end()) {
+                        continue;
+                    }
+                    RigidBody &rigidBody = tm.rigidBody;
+                    if (tallyIt->second.snap) {
+                        rigidBody.autoRejectedTranslation = true;
+                        rigidBody.lerpTranslation = false;
+                        rigidBody.lerpRotation = false;
+                        rigidBody.lerpScale = false;
+                        rigidBody.lerpSkew = false;
+                        rigidBody.lerpPerspective = false;
+                    }
+                    else if (rigidBody.autoRejectedTranslation) {
+                        // Lifting a rejection asserts that the guard misread
+                        // fast animation, and that only holds for a pair that
+                        // is a plausible step of one object. A pair further
+                        // apart than anything this game animates in a tick is
+                        // not that: it is a matrix reissued to a new object,
+                        // or two objects taken for each other. Blending such a
+                        // pair draws the new arrival sliding in from wherever
+                        // its predecessor stood -- a Pokemon visibly
+                        // travelling to its spawn point, seen only with
+                        // interpolation on, because only then is anything
+                        // blended at all. Those stay snapped, which is what
+                        // an object with no previous pose should do.
+                        const float stepDistance = float(hlslpp::length(rigidBody.linearVelocity));
+                        coherenceLiftedWorst = std::max(coherenceLiftedWorst, stepDistance);
+                        if (stepDistance > 60.0f) {
+                            continue;
+                        }
+                        // Restores exactly what the component modes ask for
+                        // with the rejection lifted, which for this game's
+                        // model tags (automatic position and rotation, scale
+                        // and skew following rotation) is a plain blend.
+                        const auto blends = [](uint8_t mode) {
+                            return (mode == G_EX_COMPONENT_INTERPOLATE) || (mode == G_EX_COMPONENT_AUTO);
+                        };
+                        rigidBody.autoRejectedTranslation = false;
+                        rigidBody.snapDiscontinuityLatch = false;
+                        rigidBody.snapLatchAcceptStreak = 0;
+                        rigidBody.lerpTranslation = blends(curGroup.positionInterpolation);
+                        rigidBody.lerpRotation = blends(curGroup.rotationInterpolation);
+                        rigidBody.lerpScale = blends(curGroup.scaleInterpolation);
+                        rigidBody.lerpSkew = blends(curGroup.skewInterpolation);
+                        rigidBody.lerpPerspective = (curGroup.perspectiveInterpolation == G_EX_COMPONENT_INTERPOLATE);
+                    }
+                }
+                if ((snapdiag::diagEnabled() || snapdiag::statsEnabled()) && ((snappedObjects + freedObjects) > 0)) {
+                    fprintf(stdout, "[SNAP-COH] objects snapped whole %u (game declared %u of them a step), rejections considered %u across %u objects, furthest %.1f\n",
+                        snappedObjects, workload.snapSteppedIdCount, freedMatrices, freedObjects, coherenceLiftedWorst);
+                }
+            }
+        }
+
+
     }
 
     void GameFrame::matchScene(WorkloadQueue &workloadQueue, const GameFrame &prevFrame, const GameScene &curScene, const GameScene &prevScene, std::unordered_map<uint32_t, ModifiedBuffers> &workloadsModified, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
@@ -480,15 +762,70 @@ namespace RT64 {
                     viewProjMap.mapped = (curProjGroup.matrixId == G_EX_ID_AUTO);
                 }
 
+                // On the frame the origin moves without a usable delta, let the
+                // camera's translation be judged the way every tagged matrix
+                // already judges its own, so it declines the shift instead of
+                // sliding across it. Applied after the group modes: the camera
+                // is tagged now, and its group cannot know about the rebase.
+                if (snapRebaseFrame && !snapRebaseUsable()) {
+                    projectionLinearComponent = G_EX_COMPONENT_AUTO;
+                }
+
                 if (viewProjMap.mapped) {
                     if (firstPrevWorkloadMap != nullptr) {
                         const GameFrameMap::ViewProjectionMap &prevViewProjMap = firstPrevWorkloadMap->viewProjections[prevProj.transformsIndex];
                         viewProjMap.rigidBody = prevViewProjMap.rigidBody;
                     }
 
-                    viewProjMap.rigidBody.updateLinear(prevView, curView, projectionLinearComponent);
-                    viewProjMap.rigidBody.updateAngular(prevView, curView, projectionAngularComponent, projectionScaleComponent, projectionSkewComponent);
-                    viewProjMap.rigidBody.updateDecomposition(curView, projectionDecompose);
+                    // The camera was translated along with everything else, so
+                    // its previous position has to be read in the new origin too.
+                    // A point given in the new origin is the old one plus the
+                    // delta, so undoing it before the old view is what lines the
+                    // two frames up.
+                    hlslpp::float4x4 rebasedPrevView;
+                    const hlslpp::float4x4 *effectivePrevView = &prevView;
+                    if (snapRebaseUsable()) {
+                        rebasedPrevView = hlslpp::mul(matrixTranslation(-snapOriginDelta), prevView);
+
+                        // The translation row of a view matrix is the eye
+                        // position already rotated through the view, so
+                        // distances taken on it mix the rotation in and say
+                        // nothing about how far the camera moved. Inverting
+                        // gives the eye itself, which is what the rebase
+                        // shifted; the rebased view's eye is by construction
+                        // the old eye plus the delta.
+                        const hlslpp::float3 curEye = hlslpp::inverse(curView)[3].xyz;
+                        const hlslpp::float3 prevEye = hlslpp::inverse(prevView)[3].xyz;
+                        const hlslpp::float3 rebasedPrevEye = prevEye + snapOriginDelta;
+                        if (float(hlslpp::length(curEye - rebasedPrevEye)) <
+                            float(hlslpp::length(curEye - prevEye))) {
+                            effectivePrevView = &rebasedPrevView;
+                            viewProjMap.snapRebasedPrev = true;
+                        }
+                    }
+
+                    // At a block transition the camera's own numbers jump by
+                    // the origin delta, so the game-side hook tags this frame
+                    // as a cut -- it cannot know the shift is a bookkeeping
+                    // move. Here the rebased previous view has already been
+                    // accepted as lining up with the current one, so the jump
+                    // the hook measured no longer exists in what
+                    // interpolation sees: blend, and the ride glides through
+                    // the corner. Genuine cuts never rebase, so their skip
+                    // stands.
+                    if (viewProjMap.snapRebasedPrev) {
+                        if (projectionLinearComponent == G_EX_COMPONENT_SKIP) {
+                            projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
+                        }
+                        if (projectionAngularComponent == G_EX_COMPONENT_SKIP) {
+                            projectionAngularComponent = G_EX_COMPONENT_INTERPOLATE;
+                        }
+                    }
+
+
+                    viewProjMap.rigidBody.updateLinear(*effectivePrevView, curView, projectionLinearComponent);
+                    viewProjMap.rigidBody.updateAngular(*effectivePrevView, curView, projectionAngularComponent, projectionScaleComponent, projectionSkewComponent);
+                    viewProjMap.rigidBody.updateDecomposition(*effectivePrevView, curView, projectionDecompose);
                     viewProjMap.prevTransformIndex = prevProj.transformsIndex;
                 }
                 else {
@@ -581,12 +918,31 @@ namespace RT64 {
         const RigidBody *prevRigidBody;
         const hlslpp::float4x4 &firstCurViewProj = firstCurWorkload.drawData.viewProjTransforms[firstCurProj.transformsIndex];
         const hlslpp::float4x4 &firstPrevViewProj = firstPrevWorkload.drawData.viewProjTransforms[firstPrevProj.transformsIndex];
+
+        // On the frame the world origin moves, candidates have to be judged with
+        // the previous frame read in the new origin, or every distance carries
+        // the whole shift and the nearest previous transform to anything is the
+        // wrong one: with the world moved further than the spacing between
+        // repeated objects, a fence post's best raw match is a different post.
+        // The per-pair check in matchTransform re-decides against the raw data,
+        // so this only makes selection see the same geometry it will.
+        hlslpp::float4x4 rebasedFirstPrevViewProj;
+        const hlslpp::float4x4 *effectivePrevViewProj = &firstPrevViewProj;
+        const bool rebasingCandidates = snapRebaseUsable();
+        if (rebasingCandidates) {
+            rebasedFirstPrevViewProj = hlslpp::mul(matrixTranslation(-snapOriginDelta), firstPrevViewProj);
+            effectivePrevViewProj = &rebasedFirstPrevViewProj;
+        }
+
         for (const IndexPair &indices : transformCheckSet) {
             const hlslpp::float4x4 &curTransform = firstCurWorkload.drawData.worldTransforms[indices.first];
-            const hlslpp::float4x4 &prevTransform = firstPrevWorkload.drawData.worldTransforms[indices.second];
+            hlslpp::float4x4 prevTransform = firstPrevWorkload.drawData.worldTransforms[indices.second];
+            if (rebasingCandidates) {
+                prevTransform[3].xyz = prevTransform[3].xyz + snapOriginDelta;
+            }
             prevRigidBody = (firstPrevWorkloadMap != nullptr) ? &firstPrevWorkloadMap->transforms[indices.second].rigidBody : nullptr;
 
-            TransformMatchResult matchResult = computeTransformMatch(curTransform, firstCurViewProj, prevTransform, firstPrevViewProj, prevRigidBody);
+            TransformMatchResult matchResult = computeTransformMatch(curTransform, firstCurViewProj, prevTransform, *effectivePrevViewProj, prevRigidBody);
             if (matchResult.valid) {
                 matchCandidates.emplace_back(indices.first, indices.second, matchResult.computeDifference());
             }
@@ -603,7 +959,7 @@ namespace RT64 {
                 continue;
             }
 
-            matchTransform(firstCurWorkload, firstPrevWorkload, firstCurWorkloadMap, firstPrevWorkloadMap, candidate.curIndex, candidate.prevIndex, modifiedBuffers);
+            matchTransform(firstCurWorkload, firstPrevWorkload, firstCurWorkloadMap, firstPrevWorkloadMap, candidate.curIndex, candidate.prevIndex, modifiedBuffers, true);
         }
 
         if (!modifiedBuffers.empty()) {
@@ -709,23 +1065,826 @@ namespace RT64 {
         }
     }
 
-    void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers) {
+
+    // Pokemon Snap port: pair this frame's tagged rectangles with the same
+    // element's rectangles in the previous frame.
+    //
+    // A texture rectangle is the one thing in a display list that carries no
+    // identity at all. It has no matrix and no vertices -- RDP::drawRect bakes
+    // the final screen coordinates straight into the call and sets both world
+    // matrix indices to zero -- so the renderer, looking only at what it was
+    // handed, has nothing to tell one rectangle from another. Pairing them by
+    // what they look like was tried: the laboratory background is a stack of
+    // identical full-width strips, and every strip matched every other, so they
+    // were drawn sliding towards each other's positions and the picture tore
+    // into bands. Nothing measurable about the pixels distinguishes strip three
+    // from strip four, because nothing about them IS different.
+    //
+    // The game knows. Each sprite is drawn from an object that owns it and
+    // whose address is stable for as long as it exists, and the port tags the
+    // display list with it. The ordinal then separates that object's own
+    // rectangles by the order it drew them, which is the order its own loop
+    // runs in and is the same every frame. So strip three pairs with strip
+    // three, and identical strips cannot be confused, because they are not
+    // being compared -- they are being named.
+    //
+    // Anything the game has not tagged keeps id zero, matches nothing, and is
+    // drawn exactly where it asked to be.
+    // Names the unnamed content that moved, so nobody has to catch it with a key.
+    //
+    // Asking the player to press a key at the moment they see something assumes the
+    // something lasts long enough to react to, and a panel sliding into place does not.
+    // This reports it instead: a rectangle that carries no identity and was not in the
+    // same place last frame is, by definition, content stepping at the game's rate while
+    // everything around it moves at the display's -- which is exactly the complaint.
+    //
+    // Reported once per distinct shape rather than once per rectangle, because a line of
+    // text is dozens of rectangles of identical size and only needs saying once. The size
+    // is what identifies the element: a panel is hundreds of pixels wide, a character is
+    // eight. Bounded to sixteen shapes so a screen full of moving content cannot flood the
+    // log, and a shape stays quiet until a couple of hundred further moving rectangles have
+    // gone by, so an animation that runs for a second says its piece once rather than
+    // sixty times.
+    static void snapReportUnnamedMotion(const FixedRect &rect) {
+        struct Shape {
+            int32_t width;
+            int32_t height;
+            uint32_t quietFrames;
+            bool used;
+        };
+
+        static Shape shapes[16] = {};
+        static uint32_t frameSerial = 0;
+        frameSerial++;
+
+        const int32_t width = (rect.lrx - rect.ulx) >> 2;
+        const int32_t height = (rect.lry - rect.uly) >> 2;
+        if ((width <= 0) || (height <= 0)) {
+            return;
+        }
+
+        Shape *slot = nullptr;
+        for (Shape &shape : shapes) {
+            if (shape.used && (shape.width == width) && (shape.height == height)) {
+                slot = &shape;
+                break;
+            }
+        }
+
+        if (slot != nullptr) {
+            // Seen recently enough that saying it again would only repeat.
+            if ((frameSerial - slot->quietFrames) < 240u) {
+                slot->quietFrames = frameSerial;
+                return;
+            }
+
+            slot->quietFrames = frameSerial;
+        }
+        else {
+            for (Shape &shape : shapes) {
+                if (!shape.used) {
+                    slot = &shape;
+                    break;
+                }
+            }
+
+            if (slot == nullptr) {
+                return;
+            }
+
+            slot->used = true;
+            slot->width = width;
+            slot->height = height;
+            slot->quietFrames = frameSerial;
+        }
+
+        fprintf(stdout, "[SNAP-2D] unnamed content MOVED: %dx%d at (%d,%d) -- this is stepping at the game's rate\n",
+            width, height, rect.ulx >> 2, rect.uly >> 2);
+        fflush(stdout);
+    }
+
+    // Says what a named rectangle DID between two drawn frames, and therefore
+    // which of the two rules will handle it.
+    //
+    // A rectangle that keeps its size is moving and its viewport is blended. One
+    // that changes size at a fixed texel rate is uncovering, and its clip is
+    // blended instead. One whose rate changed too is being rescaled, and its
+    // viewport is blended so the picture squashes the way the game intends.
+    // Those are three different pictures and the difference is invisible from
+    // outside, so an element that still looks wrong cannot be diagnosed without
+    // knowing which one it took.
+    //
+    // The two rules get their own slots. A single shared table was tried and it
+    // filled entirely with a burst of shrinking sprites, so the uncovering case
+    // -- the one being looked for -- never got a slot and the log said it never
+    // happened, while the counter beside it said it happened three hundred
+    // times. A bounded table shared between the thing you are hunting and the
+    // noise around it will always report the noise.
+    static void snapReportRectChange(const DrawCall &call, const FixedRect &prevRect, int16_t prevDsdx, int16_t prevDtdy) {
+        const int32_t curW = call.rect.lrx - call.rect.ulx;
+        const int32_t curH = call.rect.lry - call.rect.uly;
+        const int32_t prevW = prevRect.lrx - prevRect.ulx;
+        const int32_t prevH = prevRect.lry - prevRect.uly;
+        if ((curW == prevW) && (curH == prevH)) {
+            return;
+        }
+
+        struct Shape {
+            int32_t width;
+            int32_t height;
+            uint32_t quiet;
+            bool used;
+        };
+
+        static Shape uncovering[10] = {};
+        static Shape rescaling[10] = {};
+        static uint32_t serial = 0;
+        serial++;
+
+        const bool sameRate = (call.rectDsdx == prevDsdx) && (call.rectDtdy == prevDtdy);
+        Shape *table = sameRate ? uncovering : rescaling;
+
+        Shape *slot = nullptr;
+        for (uint32_t i = 0; i < 10; i++) {
+            if (table[i].used && (table[i].width == (curW >> 2)) && (table[i].height == (curH >> 2))) {
+                slot = &table[i];
+                break;
+            }
+        }
+
+        if (slot != nullptr) {
+            if ((serial - slot->quiet) < 200u) {
+                slot->quiet = serial;
+                return;
+            }
+
+            slot->quiet = serial;
+        }
+        else {
+            for (uint32_t i = 0; i < 10; i++) {
+                if (!table[i].used) {
+                    slot = &table[i];
+                    break;
+                }
+            }
+
+            if (slot == nullptr) {
+                return;
+            }
+
+            slot->used = true;
+            slot->width = curW >> 2;
+            slot->height = curH >> 2;
+            slot->quiet = serial;
+        }
+
+        // Which way it went matters as much as by how much: uncovering can only
+        // be done by clipping while the picture is GROWING, because the clip can
+        // hide part of what the current frame draws and cannot conjure rows the
+        // current frame does not contain.
+        const char *direction = ((curW * curH) >= (prevW * prevH)) ? "growing" : "shrinking";
+        fprintf(stdout, "[SNAP-2D] named rect resized: %dx%d at (%d,%d) -> %dx%d at (%d,%d), %s, rate %d/%d -> %d/%d, treated as %s\n",
+            prevW >> 2, prevH >> 2, prevRect.ulx >> 2, prevRect.uly >> 2,
+            curW >> 2, curH >> 2, call.rect.ulx >> 2, call.rect.uly >> 2,
+            direction,
+            int(prevDsdx), int(prevDtdy), int(call.rectDsdx), int(call.rectDtdy),
+            sameRate ? "UNCOVERING (clip blended)" : "RESCALING (viewport blended)");
+        fflush(stdout);
+    }
+
+    // Pokemon Snap port: whether two primitive colours are the same bytes.
+    static bool snapSameColor(const interop::float4 &a, const interop::float4 &b) {
+        const float ax = a.x, ay = a.y, az = a.z, aw = a.w;
+        const float bx = b.x, by = b.y, bz = b.z, bw = b.w;
+        return (ax == bx) && (ay == by) && (az == bz) && (aw == bw);
+    }
+
+    // A colour the game steps once per frame steps at the game's rate while
+    // everything around it moves at the display's, because the interpolation
+    // blends transforms and never colours. The fade to black between screens
+    // is the case that shows: a full-screen quad whose primitive alpha the
+    // game moves by 255 / (seconds * 60) per tick (decomp app_render/52DE0.c).
+    //
+    // A triangle call whose single world transform was matched to last frame's
+    // is looked up under that previous transform; the call in the same place
+    // there with the same combiner, other mode, geometry mode, triangle count
+    // and tile count is the same draw. Where its primitive colour differs, the
+    // previous colour is noted on this frame's recorded parameters and the
+    // raster shader blends from it by the sub-frame's weight (RasterPS.hlsl,
+    // FramebufferParams::snapPrimWeight). A call under an unmatched transform,
+    // spanning more than one matrix, drawn differently, or drawn for the first
+    // time is left as the game drew it. The parameters are compared and
+    // written per call, never stored across frames.
+    bool GameFrame::snapMatchPrimColors(Workload &curWorkload, const Workload &prevWorkload, const GameFrameMap::WorkloadMap &curWorkloadMap) {
+        auto trianglesOf = [](const Projection &proj) {
+            return (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
+        };
+
+        // The previous frame's single-matrix calls, per world transform, in
+        // the order they were drawn.
+        thread_local std::unordered_map<uint32_t, std::vector<const DrawCall *>> prevByTransform;
+        prevByTransform.clear();
+        for (uint32_t f = 0; f < prevWorkload.fbPairCount; f++) {
+            const FramebufferPair &fbPair = prevWorkload.fbPairs[f];
+            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+                const Projection &proj = fbPair.projections[p];
+                if (!trianglesOf(proj)) {
+                    continue;
+                }
+
+                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+                    const DrawCall &call = proj.gameCalls[c].callDesc;
+                    if (call.minWorldMatrix == call.maxWorldMatrix) {
+                        prevByTransform[call.minWorldMatrix].push_back(&call);
+                    }
+                }
+            }
+        }
+
+        if (prevByTransform.empty()) {
+            return false;
+        }
+
+        auto sameDraw = [](const DrawCall &a, const DrawCall &b) {
+            return (a.colorCombiner.L == b.colorCombiner.L) && (a.colorCombiner.H == b.colorCombiner.H) &&
+                (a.otherMode.L == b.otherMode.L) && (a.otherMode.H == b.otherMode.H) &&
+                (a.geometryMode == b.geometryMode) && (a.triangleCount == b.triangleCount) && (a.tileCount == b.tileCount);
+        };
+
+        // F12 (the mark key) asks for the next frames' pairs; this reports
+        // every single-matrix triangle call of two triangles or fewer -- the
+        // fade's quad among them -- and what became of it, so a fade that
+        // still steps says why from the log alone.
+        const bool dump = snapdiag::pairDumpPending().load(std::memory_order_relaxed) > 0;
+        uint32_t dumpConsidered = 0;
+        uint32_t dumpMapped = 0;
+        uint32_t dumpPaired = 0;
+        auto report = [&](const DrawCall &call, const char *what) {
+            if (dump && (call.triangleCount <= 2)) {
+                fprintf(stdout, "[SNAP-PRIM] tri call %u (%u tris, matrix %u, cc %08X%08X, prim %.2f %.2f %.2f a %.2f): %s\n",
+                    call.callIndex, call.triangleCount, call.minWorldMatrix, call.colorCombiner.H, call.colorCombiner.L,
+                    float(call.rdpParams.primColor.x), float(call.rdpParams.primColor.y), float(call.rdpParams.primColor.z), float(call.rdpParams.primColor.w), what);
+            }
+        };
+
+        // This frame's single-matrix calls, counted per transform so the k-th
+        // call under a transform pairs with the k-th under its previous one.
+        thread_local std::unordered_map<uint32_t, uint32_t> seenByTransform;
+        seenByTransform.clear();
+        bool changed = false;
+        for (uint32_t f = 0; f < curWorkload.fbPairCount; f++) {
+            const FramebufferPair &fbPair = curWorkload.fbPairs[f];
+            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+                const Projection &proj = fbPair.projections[p];
+                if (!trianglesOf(proj)) {
+                    continue;
+                }
+
+                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+                    const DrawCall &call = proj.gameCalls[c].callDesc;
+                    if (call.minWorldMatrix != call.maxWorldMatrix) {
+                        continue;
+                    }
+
+                    const uint32_t transformIndex = call.minWorldMatrix;
+                    const uint32_t ordinal = seenByTransform[transformIndex]++;
+                    dumpConsidered++;
+                    if (transformIndex >= curWorkloadMap.transforms.size()) {
+                        report(call, "matrix index outside the transform map");
+                        continue;
+                    }
+
+                    const GameFrameMap::TransformMap &transformMap = curWorkloadMap.transforms[transformIndex];
+                    if (!transformMap.mapped) {
+                        report(call, "transform not matched to last frame");
+                        continue;
+                    }
+
+                    dumpMapped++;
+                    auto prevIt = prevByTransform.find(transformMap.prevTransformIndex);
+                    if ((prevIt == prevByTransform.end()) || (ordinal >= prevIt->second.size())) {
+                        report(call, "no call in the same place under last frame's transform");
+                        continue;
+                    }
+
+                    const DrawCall &prevCall = *prevIt->second[ordinal];
+                    if (!sameDraw(call, prevCall)) {
+                        report(call, "last frame's call there is a different draw");
+                        continue;
+                    }
+
+                    if (snapSameColor(call.rdpParams.primColor, prevCall.rdpParams.primColor)) {
+                        report(call, "same primitive colour as last frame");
+                        continue;
+                    }
+
+                    if (call.callIndex >= curWorkload.drawData.rdpParams.size()) {
+                        report(call, "call index outside the RDP parameters");
+                        continue;
+                    }
+
+                    interop::RDPParams &params = curWorkload.drawData.rdpParams[call.callIndex];
+                    params.snapPrevPrimColor = prevCall.rdpParams.primColor;
+                    params.snapPrimBlend = 1.0f;
+                    changed = true;
+                    dumpPaired++;
+                    report(call, "PAIRED: colour blends from last frame's");
+                }
+            }
+        }
+
+        if (dump) {
+            fprintf(stdout, "[SNAP-PRIM] %u single-matrix triangle calls, %u under matched transforms, %u colour pairs\n",
+                dumpConsidered, dumpMapped, dumpPaired);
+        }
+        else if (snapdiag::statsEnabled() && (dumpPaired > 0)) {
+            // Under SNAP_STATS, one line per frame that blended a triangle
+            // colour: a fade shows as a run of them, hands-free.
+            fprintf(stdout, "[SNAP-PRIM] %u triangle colour pairs this frame\n", dumpPaired);
+        }
+
+        return changed;
+    }
+
+    bool GameFrame::snapMatchRects(Workload &curWorkload, const Workload &prevWorkload) {
+        // The rectangle AND the rate it sampled its texture at. A rectangle
+        // that grew while its texel rate held still is uncovering more of a
+        // picture; one whose rate changed is being rescaled. They look the same
+        // in the corners alone and need opposite treatment.
+        struct PrevRect {
+            FixedRect rect;
+            int16_t dsdx;
+            int16_t dtdy;
+            interop::float4 primColor;
+        };
+
+        thread_local std::unordered_map<uint64_t, PrevRect> prevRects;
+        bool changed = false;
+        uint32_t colourPairs = 0;
+        prevRects.clear();
+
+        // How many rectangles each element drew, on each side.
+        //
+        // This is not a diagnostic. The pairing key is (element, ordinal) and
+        // the ordinal is nothing but the order the element emitted its
+        // rectangles in, so it only means the same thing on both sides while
+        // this number does. An element that drew seven rectangles last frame
+        // and eight this frame has had every ordinal after the insertion point
+        // shifted, and pairing them matches pieces of it to other pieces of it
+        // -- which is the failure that tore the laboratory background into
+        // bands, happening inside one element instead of across a screenful.
+        //
+        // Measured on a real session it is rare, a few elements in a thousand,
+        // and the pairs it produces are visibly wrong: one moved a hundred and
+        // thirty pixels across the screen while changing size, which no
+        // interface element does in a thirtieth of a second. Counted on both
+        // sides and refused when they disagree.
+        const bool countRectStats = snapdiag::statsEnabled();
+        thread_local std::unordered_map<uint32_t, uint32_t> prevCounts;
+        thread_local std::unordered_map<uint32_t, uint32_t> curCounts;
+
+        // Every rectangle each element drew, on each side, for the case the
+        // counts disagree. A sprite entering the screen is scissored: the
+        // strips still outside are not emitted, so its count grows frame by
+        // frame as it slides in and every ordinal shifts, which the rule above
+        // refuses -- correctly, for the ordinals. But all of an element's
+        // rectangles move by one translation, so when the ordinals cannot be
+        // trusted the element is asked for the translation most of its
+        // rectangles agree on, and each rectangle pairs with the previous one
+        // of its exact size that sits at that translation from it. Strips with
+        // no counterpart stay where the game put them. Pokemon Snap's panels
+        // and its course-select monitor slide in from off screen, and stepped
+        // for the whole slide before this.
+        thread_local std::unordered_map<uint32_t, std::vector<PrevRect>> prevById;
+        thread_local std::unordered_map<uint32_t, std::vector<const DrawCall *>> curById;
+
+        // Every unnamed rectangle's exact corners, so a rectangle that has not
+        // moved can be told from one that has.
+        thread_local std::unordered_set<uint64_t> prevUnnamed;
+        prevCounts.clear();
+        curCounts.clear();
+        prevById.clear();
+        curById.clear();
+        if (countRectStats) {
+            prevUnnamed.clear();
+        }
+
+        auto cornersOf = [](const FixedRect &r) {
+            return (uint64_t(uint32_t(r.ulx) & 0xFFFFu) << 48) |
+                   (uint64_t(uint32_t(r.uly) & 0xFFFFu) << 32) |
+                   (uint64_t(uint32_t(r.lrx) & 0xFFFFu) << 16) |
+                    uint64_t(uint32_t(r.lry) & 0xFFFFu);
+        };
+
+        auto keyOf = [](const DrawCall &call) {
+            return (uint64_t(call.snapRectId) << 32) | uint64_t(call.snapRectOrdinal);
+        };
+
+        for (uint32_t f = 0; f < prevWorkload.fbPairCount; f++) {
+            const FramebufferPair &fbPair = prevWorkload.fbPairs[f];
+            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+                const Projection &proj = fbPair.projections[p];
+                if (proj.type != Projection::Type::Rectangle) {
+                    continue;
+                }
+
+                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+                    const DrawCall &call = proj.gameCalls[c].callDesc;
+                    if (call.snapRectId != 0) {
+                        prevRects.insert({ keyOf(call), PrevRect{ call.rect, call.rectDsdx, call.rectDtdy, call.rdpParams.primColor } });
+                        prevCounts[call.snapRectId]++;
+                        prevById[call.snapRectId].push_back(PrevRect{ call.rect, call.rectDsdx, call.rectDtdy, call.rdpParams.primColor });
+                    }
+                    else if (countRectStats) {
+                        prevUnnamed.insert(cornersOf(call.rect));
+                    }
+                }
+            }
+        }
+
+        if (prevRects.empty()) {
+            return false;
+        }
+
+        // Counted before anything is paired: whether ordinal three is
+        // trustworthy depends on how many rectangles the element turns out to
+        // draw in total, which is not known until its last one has been seen.
+        for (uint32_t f = 0; f < curWorkload.fbPairCount; f++) {
+            const FramebufferPair &fbPair = curWorkload.fbPairs[f];
+            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+                const Projection &proj = fbPair.projections[p];
+                if (proj.type != Projection::Type::Rectangle) {
+                    continue;
+                }
+
+                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+                    const DrawCall &call = proj.gameCalls[c].callDesc;
+                    if (call.snapRectId != 0) {
+                        curCounts[call.snapRectId]++;
+                        curById[call.snapRectId].push_back(&call);
+                    }
+                }
+            }
+        }
+
+        // An object's address can be handed to a different object once the
+        // first one is gone. The id is then honest about what it names and
+        // still wrong about what it means, and the only symptom is a rectangle
+        // that appears to travel an impossible distance in one frame. Real 2D
+        // motion in this game is tens of pixels per frame; a jump across most
+        // of the screen is a recycled address, not a moving sprite, and it is
+        // shown where it is rather than swept there from somewhere else.
+        const int32_t MaxTravel = 160 << 2;
+
+        // The translation vote, computed once per element per frame and only
+        // when asked (an element whose counts agree never needs it).
+        struct Vote {
+            bool tried = false;
+            bool valid = false;
+            int32_t dx = 0;
+            int32_t dy = 0;
+        };
+        thread_local std::unordered_map<uint32_t, Vote> votes;
+        votes.clear();
+        auto sameSize = [](const FixedRect &a, const FixedRect &b) {
+            return ((a.lrx - a.ulx) == (b.lrx - b.ulx)) && ((a.lry - a.uly) == (b.lry - b.uly));
+        };
+        auto voteFor = [&](const DrawCall &call) -> const PrevRect * {
+            const uint32_t id = call.snapRectId;
+            Vote &vote = votes[id];
+            const auto prevIt = prevById.find(id);
+            const auto curIt = curById.find(id);
+            if (!vote.tried) {
+                vote.tried = true;
+                if ((prevIt != prevById.end()) && (curIt != curById.end()) &&
+                    ((prevIt->second.size() * curIt->second.size()) <= 4096)) {
+                    const std::vector<PrevRect> &prevs = prevIt->second;
+                    const std::vector<const DrawCall *> &curs = curIt->second;
+                    int32_t bestSupport = 0;
+                    // Every current-previous pair of one size proposes the
+                    // translation between them; the proposal most of the
+                    // element's rectangles can follow exactly wins.
+                    for (const DrawCall *c : curs) {
+                        for (const PrevRect &p : prevs) {
+                            if (!sameSize(c->rect, p.rect) || (c->rectDsdx != p.dsdx) || (c->rectDtdy != p.dtdy)) {
+                                continue;
+                            }
+                            const int32_t dx = c->rect.ulx - p.rect.ulx;
+                            const int32_t dy = c->rect.uly - p.rect.uly;
+                            if ((std::abs(dx) > MaxTravel) || (std::abs(dy) > MaxTravel)) {
+                                continue;
+                            }
+                            int32_t support = 0;
+                            for (const DrawCall *c2 : curs) {
+                                for (const PrevRect &p2 : prevs) {
+                                    if (sameSize(c2->rect, p2.rect) && ((c2->rect.ulx - p2.rect.ulx) == dx) &&
+                                        ((c2->rect.uly - p2.rect.uly) == dy)) {
+                                        support++;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (support > bestSupport) {
+                                bestSupport = support;
+                                vote.dx = dx;
+                                vote.dy = dy;
+                            }
+                        }
+                    }
+                    // Two rectangles at least, and at least half of what the
+                    // element drew this frame, have to agree; one rectangle
+                    // agreeing with itself proves nothing.
+                    const int32_t needed = std::max<int32_t>(2, int32_t((curs.size() + 1) / 2));
+                    vote.valid = (bestSupport >= needed);
+                }
+            }
+            if (!vote.valid || (prevIt == prevById.end())) {
+                return nullptr;
+            }
+            for (const PrevRect &p : prevIt->second) {
+                if (sameSize(call.rect, p.rect) && (call.rectDsdx == p.dsdx) && (call.rectDtdy == p.dtdy) &&
+                    ((call.rect.ulx - p.rect.ulx) == vote.dx) && ((call.rect.uly - p.rect.uly) == vote.dy)) {
+                    return &p;
+                }
+            }
+            return nullptr;
+        };
+
+        // While the present queue is photographing a burst, every decision made
+        // here is printed against the same game-frame number the pictures carry.
+        // A pair line and a captured frame are then two views of one moment: the
+        // dump says what the matcher decided, the picture says what it looked
+        // like. MISS lines carry the reason, because a frozen sprite and a
+        // mispaired sprite look identical in the counters and nothing else
+        // separates them.
+        const bool snapDumpWindow = (snap_frame_dump_pending.load(std::memory_order_relaxed) > 0);
+        if (snapDumpWindow) {
+            fprintf(stdout, "[SNAP-PAIR] === match into g%u ===\n",
+                snapdiag::gameFrameCounter().load(std::memory_order_relaxed));
+        }
+
+        for (uint32_t f = 0; f < curWorkload.fbPairCount; f++) {
+            FramebufferPair &fbPair = curWorkload.fbPairs[f];
+            for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
+                Projection &proj = fbPair.projections[p];
+                if (proj.type != Projection::Type::Rectangle) {
+                    continue;
+                }
+
+                for (uint32_t c = 0; c < proj.gameCallCount; c++) {
+                    DrawCall &call = proj.gameCalls[c].callDesc;
+                    if (countRectStats) {
+                        snapdiag::rectsTotalCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    if (call.snapRectId == 0) {
+                        if (countRectStats) {
+                            if (prevUnnamed.find(cornersOf(call.rect)) != prevUnnamed.end()) {
+                                snapdiag::rectsUnnamedStillCounter().fetch_add(1, std::memory_order_relaxed);
+                            }
+                            else {
+                                snapdiag::rectsUnnamedMovedCounter().fetch_add(1, std::memory_order_relaxed);
+                                snapReportUnnamedMotion(call.rect);
+                            }
+                        }
+                        if (snapDumpWindow) {
+                            const int32_t w = (call.rect.lrx - call.rect.ulx) >> 2;
+                            const int32_t h = (call.rect.lry - call.rect.uly) >> 2;
+                            // Sprite-sized only: full-screen fills and one-pixel
+                            // seams would bury the effect rectangles the window
+                            // exists to explain.
+                            if ((w >= 4) && (w <= 320) && (h >= 2) && (h <= 150)) {
+                                fprintf(stdout, "[SNAP-PAIR] f%u UNNAMED (%d,%d %dx%d)\n",
+                                    f, call.rect.ulx >> 2, call.rect.uly >> 2, w, h);
+                            }
+                        }
+                        continue;
+                    }
+                    if (countRectStats) {
+                        snapdiag::rectsSeenCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    // The element drew a different number of rectangles than it
+                    // did last frame, so this one's ordinal does not name the
+                    // same piece of it that it named before. Left where the game
+                    // put it.
+                    const PrevRect *paired = nullptr;
+                    const auto prevCountIt = prevCounts.find(call.snapRectId);
+                    const bool countsAgree = (prevCountIt != prevCounts.end()) &&
+                                             (prevCountIt->second == curCounts[call.snapRectId]);
+                    if (countsAgree) {
+                        const auto it = prevRects.find(keyOf(call));
+                        if (it != prevRects.end()) {
+                            paired = &it->second;
+                        }
+                    }
+                    if (paired == nullptr) {
+                        // The ordinals cannot be trusted (or one is missing):
+                        // the element's translation vote decides.
+                        paired = voteFor(call);
+                    }
+                    if (paired == nullptr) {
+                        if (snapDumpWindow) {
+                            fprintf(stdout, "[SNAP-PAIR] f%u MISS id %08X ord %u (%d,%d %dx%d) %s prev-count %u cur-count %u\n",
+                                f, call.snapRectId, call.snapRectOrdinal,
+                                call.rect.ulx >> 2, call.rect.uly >> 2,
+                                (call.rect.lrx - call.rect.ulx) >> 2, (call.rect.lry - call.rect.uly) >> 2,
+                                (prevCountIt == prevCounts.end()) ? "new-id" : (countsAgree ? "no-prev-ordinal" : "count-changed, no vote"),
+                                (prevCountIt == prevCounts.end()) ? 0u : prevCountIt->second,
+                                curCounts[call.snapRectId]);
+                        }
+                        continue;
+                    }
+                    const FixedRect &prevRect = paired->rect;
+                    const bool travelled =
+                        (std::abs(call.rect.ulx - prevRect.ulx) > MaxTravel) ||
+                        (std::abs(call.rect.uly - prevRect.uly) > MaxTravel) ||
+                        (std::abs(call.rect.lrx - prevRect.lrx) > MaxTravel) ||
+                        (std::abs(call.rect.lry - prevRect.lry) > MaxTravel);
+                    if (countRectStats) {
+                        const int32_t worst = std::max(std::max(std::abs(call.rect.ulx - prevRect.ulx),
+                                                                std::abs(call.rect.uly - prevRect.uly)),
+                                                       std::max(std::abs(call.rect.lrx - prevRect.lrx),
+                                                                std::abs(call.rect.lry - prevRect.lry)));
+                        const uint32_t worstPixels = uint32_t(worst >> 2);
+                        uint32_t seenWorst = snapdiag::rectBiggestTravelCounter().load(std::memory_order_relaxed);
+                        while ((worstPixels > seenWorst) &&
+                               !snapdiag::rectBiggestTravelCounter().compare_exchange_weak(seenWorst, worstPixels, std::memory_order_relaxed)) {
+                        }
+                    }
+
+                    if (travelled) {
+                        if (countRectStats) {
+                            snapdiag::rectTravelRefusedCounter().fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (snapDumpWindow) {
+                            fprintf(stdout, "[SNAP-PAIR] f%u MISS id %08X ord %u (%d,%d %dx%d) travelled from (%d,%d %dx%d)\n",
+                                f, call.snapRectId, call.snapRectOrdinal,
+                                call.rect.ulx >> 2, call.rect.uly >> 2,
+                                (call.rect.lrx - call.rect.ulx) >> 2, (call.rect.lry - call.rect.uly) >> 2,
+                                prevRect.ulx >> 2, prevRect.uly >> 2,
+                                (prevRect.lrx - prevRect.ulx) >> 2, (prevRect.lry - prevRect.uly) >> 2);
+                        }
+                        continue;
+                    }
+
+                    call.snapPrevRect = prevRect;
+                    call.snapPrevDsdx = paired->dsdx;
+                    call.snapPrevDtdy = paired->dtdy;
+                    call.snapRectMapped = true;
+
+                    // A sprite fading is the same rectangle drawn with a
+                    // different primitive colour (the window library and the
+                    // sprite library both set the sprite's red, green, blue
+                    // and alpha there); the shader blends it between the two
+                    // frames the same way it blends a triangle call's (see
+                    // snapMatchPrimColors).
+                    if (!snapSameColor(call.rdpParams.primColor, paired->primColor) && (call.callIndex < curWorkload.drawData.rdpParams.size())) {
+                        interop::RDPParams &params = curWorkload.drawData.rdpParams[call.callIndex];
+                        params.snapPrevPrimColor = paired->primColor;
+                        params.snapPrimBlend = 1.0f;
+                        changed = true;
+                        colourPairs++;
+                        if (snapdiag::pairDumpPending().load(std::memory_order_relaxed) > 0) {
+                            fprintf(stdout, "[SNAP-PRIM] f%u rect id %08X ord %u: colour (%.2f %.2f %.2f a %.2f) -> (%.2f %.2f %.2f a %.2f)\n",
+                                f, call.snapRectId, call.snapRectOrdinal,
+                                float(paired->primColor.x), float(paired->primColor.y), float(paired->primColor.z), float(paired->primColor.w),
+                                float(call.rdpParams.primColor.x), float(call.rdpParams.primColor.y), float(call.rdpParams.primColor.z), float(call.rdpParams.primColor.w));
+                        }
+                    }
+
+                    // The mark key asks for the next frames' actual pairs. One
+                    // line per pair: what joined what. Wrong pairs are visible
+                    // as lines whose two rectangles are not the same thing.
+                    if (snapDumpWindow || (snapdiag::pairDumpPending().load(std::memory_order_relaxed) > 0)) {
+                        fprintf(stdout, "[SNAP-PAIR] f%u id %08X ord %u: (%d,%d %dx%d) -> (%d,%d %dx%d)\n",
+                            f, call.snapRectId, call.snapRectOrdinal,
+                            prevRect.ulx >> 2, prevRect.uly >> 2,
+                            (prevRect.lrx - prevRect.ulx) >> 2, (prevRect.lry - prevRect.uly) >> 2,
+                            call.rect.ulx >> 2, call.rect.uly >> 2,
+                            (call.rect.lrx - call.rect.ulx) >> 2, (call.rect.lry - call.rect.uly) >> 2);
+                    }
+
+                    if (countRectStats) {
+                        snapReportRectChange(call, prevRect, paired->dsdx, paired->dtdy);
+                    }
+
+                    if (countRectStats) {
+                        const int32_t curW = call.rect.lrx - call.rect.ulx;
+                        const int32_t curH = call.rect.lry - call.rect.uly;
+                        const int32_t prevW = prevRect.lrx - prevRect.ulx;
+                        const int32_t prevH = prevRect.lry - prevRect.uly;
+                        const int32_t dW = std::abs(curW - prevW);
+                        const int32_t dH = std::abs(curH - prevH);
+                        if ((dW != 0) || (dH != 0)) {
+                            snapdiag::rectSizeChangedCounter().fetch_add(1, std::memory_order_relaxed);
+                            const uint32_t worstPixels = uint32_t(std::max(dW, dH) >> 2);
+                            uint32_t seen = snapdiag::rectBiggestSizeChangeCounter().load(std::memory_order_relaxed);
+                            while ((worstPixels > seen) &&
+                                   !snapdiag::rectBiggestSizeChangeCounter().compare_exchange_weak(seen, worstPixels, std::memory_order_relaxed)) {
+                            }
+                        }
+                    }
+                    if (countRectStats) {
+                        snapdiag::rectsPairedCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+
+        {
+            // A replay has nobody at the keyboard, so the dump can also fire on
+            // a clock: SNAP_PAIRDUMP=N asks for the pairs of one frame every N
+            // matcher runs, which over a two minute ride samples every part of
+            // it without drowning the log.
+            static uint32_t dumpEvery = []() {
+                const char* env = getenv("SNAP_PAIRDUMP");
+                return (env != nullptr) ? uint32_t(atoi(env)) : 0u;
+            }();
+            static uint32_t sinceDump = 0;
+            if ((dumpEvery > 0) && (++sinceDump >= dumpEvery)) {
+                sinceDump = 0;
+                // Two, not one: the block below consumes a count in the same
+                // breath, and the pair loop that actually prints runs on the
+                // NEXT frame. Set to one here, it was consumed before any pair
+                // could see it, and the clock-driven dump printed nothing.
+                snapdiag::pairDumpPending().store(2, std::memory_order_relaxed);
+            }
+
+            uint32_t pending = snapdiag::pairDumpPending().load(std::memory_order_relaxed);
+            if (pending > 0) {
+                snapdiag::pairDumpPending().store(pending - 1, std::memory_order_relaxed);
+                fflush(stdout);
+            }
+
+            if (snapDumpWindow) {
+                fflush(stdout);
+            }
+        }
+
+        // The measurement the ordinal rests on: an element that drew a
+        // different number of rectangles than it did last frame has had its
+        // ordinals shifted, so rectangle three is a different piece of it now.
+        if (countRectStats) {
+            for (const auto &entry : curCounts) {
+                snapdiag::rectElementsCounter().fetch_add(1, std::memory_order_relaxed);
+                auto prevIt = prevCounts.find(entry.first);
+                if ((prevIt != prevCounts.end()) && (prevIt->second != entry.second)) {
+                    snapdiag::rectCountChangedCounter().fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        if (countRectStats && (colourPairs > 0)) {
+            fprintf(stdout, "[SNAP-PRIM] %u rectangle colour pairs this frame\n", colourPairs);
+        }
+
+        return changed;
+    }
+
+    void GameFrame::matchTransform(Workload &curWorkload, const Workload &prevWorkload, GameFrameMap::WorkloadMap &curWorkloadMap, const GameFrameMap::WorkloadMap *prevWorkloadMap, uint32_t curTransformIndex, uint32_t prevTransformIndex, ModifiedBuffers &modifiedBuffers, bool computeVelocities) {
         GameFrameMap::TransformMap &curTransformMap = curWorkloadMap.transforms[curTransformIndex];
         if (prevWorkloadMap != nullptr) {
             curTransformMap.rigidBody = prevWorkloadMap->transforms[prevTransformIndex].rigidBody;
         }
 
         const hlslpp::float4x4 &curTransform = curWorkload.drawData.worldTransforms[curTransformIndex];
-        const hlslpp::float4x4 &prevTransform = prevWorkload.drawData.worldTransforms[prevTransformIndex];
+        const hlslpp::float4x4 &rawPrevTransform = prevWorkload.drawData.worldTransforms[prevTransformIndex];
+
+        // Object matrices carry positions in the world's own frame, so moving
+        // one into this frame's origin is just adding the delta to it. Taken
+        // only when it lands nearer than leaving it alone, which is what keeps a
+        // wrong delta from doing damage.
+        hlslpp::float4x4 rebasedPrevTransform;
+        const hlslpp::float4x4 *effectivePrev = &rawPrevTransform;
+        if (snapRebaseUsable()) {
+            rebasedPrevTransform = rawPrevTransform;
+            rebasedPrevTransform[3].xyz = rebasedPrevTransform[3].xyz + snapOriginDelta;
+            if (float(hlslpp::length(curTransform[3].xyz - rebasedPrevTransform[3].xyz)) <
+                float(hlslpp::length(curTransform[3].xyz - rawPrevTransform[3].xyz))) {
+                effectivePrev = &rebasedPrevTransform;
+                curTransformMap.snapRebasedPrev = true;
+            }
+        }
+
+        const hlslpp::float4x4 &prevTransform = *effectivePrev;
         const uint32_t curGroupIndex = curWorkload.drawData.worldTransformGroups[curTransformIndex];
         const TransformGroup &curGroup = curWorkload.drawData.transformGroups[curGroupIndex];
         curTransformMap.rigidBody.updateLinear(prevTransform, curTransform, curGroup.positionInterpolation);
         curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
         curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
-        curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
+        curTransformMap.rigidBody.updateDecomposition(prevTransform, curTransform, curGroup.decompose);
         curTransformMap.prevTransformIndex = prevTransformIndex;
         curTransformMap.mapped = true;
         curWorkloadMap.prevTransformsMapped[prevTransformIndex] = true;
+
+        // Pokemon Snap port: per-vertex velocities are skipped entirely. The
+        // game rebuilds its vertex heap every frame, so equal-count vertex
+        // ranges can pair up misaligned geometry and fling vertices across
+        // the screen on interpolated frames (black needle spikes).
+        if (!computeVelocities) {
+            return;
+        }
 
         uint64_t curVertexHash = 0;
         uint64_t prevVertexHash = 0;

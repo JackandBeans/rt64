@@ -39,8 +39,20 @@ namespace RT64 {
         fillRectOnly = fillRectOnly && (proj.type == Projection::Type::Rectangle) && (gameCall.callDesc.otherMode.cycleType() == G_CYC_FILL);
         gameCallCount++;
 
-        // Track what type of color dither this call used.
-        uint32_t ditherIndex = (gameCall.callDesc.otherMode.rgbDither() >> G_MDSFT_RGBDITHER) & 0x3;
+        // Track what type of color dither this call used. Fill and copy cycle
+        // types never dither on hardware regardless of the othermode dither
+        // bits, so count them as disabled: games that fill a buffer with a
+        // sentinel value (e.g. Pokemon Snap's photo-scoring z-buffers, filled
+        // with 0xFFFC via fillrect) depend on the writeback reproducing the
+        // exact fill value.
+        const uint32_t cycleType = gameCall.callDesc.otherMode.cycleType();
+        uint32_t ditherIndex;
+        if ((cycleType == G_CYC_FILL) || (cycleType == G_CYC_COPY)) {
+            ditherIndex = (G_CD_DISABLE >> G_MDSFT_RGBDITHER) & 0x3;
+        }
+        else {
+            ditherIndex = (gameCall.callDesc.otherMode.rgbDither() >> G_MDSFT_RGBDITHER) & 0x3;
+        }
         ditherPatterns[ditherIndex]++;
     }
 
@@ -67,6 +79,30 @@ namespace RT64 {
 
     bool FramebufferPair::isEmpty() const {
         return (gameCallCount == 0) && startFbOperations.empty() && endFbOperations.empty();
+    }
+
+    // Pokemon Snap port: what a pass covers on the display. The native
+    // rectangle is fitted to where the triangles landed against the 4:3
+    // viewport, before the projection is widened, so a pass whose every
+    // triangle lies past the 4:3 edge has an empty one and was dropped --
+    // and the game's photo detector puts each Pokemon in a pass of its own,
+    // so a Pokemon entirely in the widened picture's margin was never drawn.
+    // In a widened view such a pass keeps the scissor of any perspective
+    // projection that drew, and the GPU's clipping decides the pixels. The
+    // native rectangle itself stays as it is: it bounds the RDRAM writeback
+    // and the detector's reads, which the margins never reach. Identified by
+    // mstan in pull request 5.
+    FixedRect FramebufferPair::displayColorRect(bool expandedView) const {
+        FixedRect bounds = drawColorRect;
+        if (expandedView && bounds.isEmpty()) {
+            for (uint32_t i = 0; i < projectionCount; i++) {
+                const Projection &proj = projections[i];
+                if ((proj.type == Projection::Type::Perspective) && (proj.gameCallCount > 0)) {
+                    bounds.merge(proj.scissorRect);
+                }
+            }
+        }
+        return bounds;
     }
     
     bool FramebufferPair::earlyPresentCandidate() const {

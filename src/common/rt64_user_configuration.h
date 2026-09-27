@@ -88,6 +88,12 @@ namespace RT64 {
         DisplayBuffering displayBuffering;
         Antialiasing antialiasing;
         double resolutionMultiplier;
+        // Pokemon Snap port: with WindowIntegerScale, the ceiling the
+        // window-derived multiplier may reach. Zero means uncapped. A large
+        // window otherwise implies a render size the machine cannot hold --
+        // measured here: 280 fps at 4x, collapse at the ~6x a 1440p window
+        // asks for -- and presentation already scales any render size up.
+        double resolutionMultiplierCap;
         int downsampleMultiplier;
         Filtering filtering;
         AspectRatio aspectRatio;
@@ -95,6 +101,14 @@ namespace RT64 {
         AspectRatio extAspectRatio;
         double extAspectTarget;
         Upscale2D upscale2D;
+        // Pokemon Snap port. Both default off: the console's look.
+        // snapPhotoDetail: sprites that sample the game's own offscreen photo
+        // render are served from the renderer's full-resolution copy of it.
+        // snapJynxVC: the primitive colour Jynx's untextured face and hands
+        // are drawn with is swapped for the purple Nintendo's re-releases
+        // use, on each recorded draw call (render/rt64_snap_recolor.h).
+        bool snapPhotoDetail = false;
+        bool snapJynxVC = false;
         bool threePointFiltering;
         RefreshRate refreshRate;
         int refreshRateTarget;

@@ -60,6 +60,13 @@ namespace RT64 {
         std::vector<interop::GPUTile> gpuTiles;
         std::vector<DrawCallTile> callTiles;
         std::vector<interop::RSPViewport> rspViewports;
+        // Pokemon Snap port: the viewports as rendered this sub-frame -- for a
+        // matched, view-interpolated projection the entry is blended between
+        // the previous frame's viewport and this one's, so a scene the game
+        // scales into an animated inset (the photo mode's letterbox) scales at
+        // the display's rate instead of stepping at the game's. Rebuilt and
+        // re-uploaded per sub-frame by the projection processor.
+        std::vector<interop::RSPViewport> modRspViewports;
         std::vector<int16_t> viewportClipRatios;
         std::vector<uint16_t> viewportOrigins;
         std::vector<interop::RSPFog> rspFog;
@@ -211,6 +218,61 @@ namespace RT64 {
 
     struct Workload {
         uint64_t submissionFrame;
+        // Pokemon Snap port: set on the workload of the frame the game moved its
+        // world origin on, with the distance it moved by. Carried here rather
+        // than on the queue because the render thread runs behind the game
+        // thread, and a queue-level flag is read against whichever frame pair
+        // happens to be current when it gets there.
+        bool snapOriginRebased = false;
+        hlslpp::float3 snapOriginDelta = {};
+        // Set on the frame a camera cut transits. The console never displayed
+        // these frames (draw skipped on RCP overrun, previous image held);
+        // the queue presents the previous frame's image for this workload's
+        // interval to match.
+        bool snapCutHold = false;
+        // Set while the game is showing a film rather than being played:
+        // menus, cards, the opening movie, a course's own opening camera.
+        // Frame holds are confined to those, because measurement of a real
+        // session showed every one of them during play produced a freeze and
+        // then a jump of two to three game frames.
+        bool snapCutscene = false;
+        // How many of the game's logic steps this drawn frame stands for.
+        // Normally two on this game; three when the game skipped a draw
+        // because the renderer still had the graphics context. A frame that
+        // covers more of the world's motion has to be spread over more of
+        // the display's time, or the motion in it finishes early and stops.
+        uint32_t snapLogicSteps = 0;
+        // Pokemon Snap port: the objects whose animation stepped to a new pose
+        // this frame rather than moving to it. The game's own animation data
+        // says so (src/matrix_tags.cpp reads it and writes the verdict into
+        // this frame's display list), and blending such a pair draws the object
+        // at positions it was never in. Bounded and fixed size: a frame with
+        // more stepping objects than this loses the surplus, which costs the
+        // port nothing it did not already have.
+        static constexpr uint32_t SnapMaxSteppedIds = 16;
+        uint32_t snapSteppedIds[SnapMaxSteppedIds] = {};
+        uint32_t snapSteppedIdCount = 0;
+
+        void snapAddSteppedId(uint32_t id) {
+            if ((id == 0) || (snapSteppedIdCount >= SnapMaxSteppedIds)) {
+                return;
+            }
+            for (uint32_t i = 0; i < snapSteppedIdCount; i++) {
+                if (snapSteppedIds[i] == id) {
+                    return;
+                }
+            }
+            snapSteppedIds[snapSteppedIdCount++] = id;
+        }
+
+        bool snapHasSteppedId(uint32_t id) const {
+            for (uint32_t i = 0; i < snapSteppedIdCount; i++) {
+                if (snapSteppedIds[i] == id) {
+                    return true;
+                }
+            }
+            return false;
+        }
         DrawData drawData;
         DrawRanges drawRanges;
         DrawBuffers drawBuffers;

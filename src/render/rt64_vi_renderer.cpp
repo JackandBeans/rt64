@@ -4,8 +4,12 @@
 
 #include "rt64_vi_renderer.h"
 
+#include <algorithm>
+
 #include "shared/rt64_hlsl.h"
 #include "shared/rt64_video_interface.h"
+
+#include "hle/rt64_snap_diag.h"
 
 namespace RT64 {
     // VIRenderer
@@ -69,7 +73,24 @@ namespace RT64 {
 
         RenderViewport viewport;
         RenderRect scissor;
-        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, viewport, scissor);
+        getViewportAndScissor(p.swapChain, *p.vi, p.resolutionScale, p.downsamplingScale, p.removeBlackBorders, p.crop, viewport, scissor);
+
+        // Pokemon Snap port: the picture's place in the window, for the
+        // mouse (snapdiag::PresentedView).
+        {
+            snapdiag::PresentedView view;
+            view.x = viewport.x;
+            view.y = viewport.y;
+            view.width = viewport.width;
+            view.height = viewport.height;
+            const hlslpp::float2 fb = hlslpp::float2(p.vi->fbSize());
+            view.fbWidth = float(fb.x);
+            view.fbHeight = float(fb.y);
+            view.aspect = float(p.resolutionScale.x) / float(p.resolutionScale.y);
+            view.swapWidth = p.swapChain->getWidth();
+            view.swapHeight = p.swapChain->getHeight();
+            snapdiag::publishPresentedView(view);
+        }
         p.commandList->setViewports(viewport);
         p.commandList->setScissors(scissor);
 
@@ -86,7 +107,7 @@ namespace RT64 {
         p.commandList->drawInstanced(3, 1, 0, 0);
     }
 
-    void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, RenderViewport &viewport, RenderRect &scissor) {
+    void VIRenderer::getViewportAndScissor(const RenderSwapChain *swapChain, const VI &vi, hlslpp::float2 resolutionScale, uint32_t downsamplingScale, bool removeBlackBorders, const uint32_t crop[4], RenderViewport &viewport, RenderRect &scissor) {
         // We define three different coordinate spaces to work with to translate the VI parameters into the Window.
         //
         // VideoSD: This corresponds to the SD TV Scanline space, which is what the VI natively works on.
@@ -121,5 +142,68 @@ namespace RT64 {
 
         viewport = RenderViewport(topLeftViewport.x, topLeftViewport.y, bottomRightViewport.x - topLeftViewport.x, bottomRightViewport.y - topLeftViewport.y);
         scissor = RenderRect(lround(topLeftScissor.x), lround(topLeftScissor.y), lround(bottomRightScissor.x), lround(bottomRightScissor.y));
+
+        // Pokemon Snap port: overscan crop. The game leaves dead margins in
+        // its framebuffer -- black in scenes, stale bytes in menus -- and its
+        // one VI mode never compensates, because the CRTs it was authored for
+        // cropped the picture's edges on every set sold. Hiding a margin of
+        // the buffer the same way: the viewport grows so the cropped region
+        // fills the same fit area, and the scissor still clips to that area,
+        // so nothing outside the fit rectangle is touched.
+        if (crop != nullptr) {
+            float cropL = float(crop[0]);
+            float cropR = float(crop[1]);
+            const float cropT = float(crop[2]);
+            const float cropB = float(crop[3]);
+
+            // Under the widescreen expansion the horizontal edges of the
+            // image are newly rendered extra field of view, not the game's
+            // authored dead columns, so a horizontal crop would trim real
+            // picture. The expansion widens only X of the resolution scale,
+            // which is how it announces itself here. The vertical margins
+            // are untouched by the expansion and still deserve the crop.
+            if (float(resolutionScale.x) > float(resolutionScale.y) * 1.001f) {
+                cropL = 0.0f;
+                cropR = 0.0f;
+            }
+
+            const float keptW = float(sdSize.x) - cropL - cropR;
+            const float keptH = float(sdSize.y) - cropT - cropB;
+
+            // The quarter-size floor bounds the zoom at 4x, which keeps the
+            // scaled viewport far inside the API's coordinate limits no
+            // matter what a hand-edited config asks for.
+            if (((cropL + cropR + cropT + cropB) > 0.0f) &&
+                (keptW >= float(sdSize.x) * 0.25f) && (keptH >= float(sdSize.y) * 0.25f)) {
+                // One uniform scale for both axes: the kept region keeps its
+                // proportions and is centered, with the smaller axis
+                // letterboxed inside the fit area, instead of unequal crops
+                // stretching the picture.
+                const float scale = std::min(float(sdSize.x) / keptW, float(sdSize.y) / keptH);
+                const float newWidth = viewport.width * scale;
+                const float newHeight = viewport.height * scale;
+                const float keptScreenW = (keptW / float(sdSize.x)) * newWidth;
+                const float keptScreenH = (keptH / float(sdSize.y)) * newHeight;
+                viewport.x += (viewport.width - keptScreenW) * 0.5f - (cropL / float(sdSize.x)) * newWidth;
+                viewport.y += (viewport.height - keptScreenH) * 0.5f - (cropT / float(sdSize.y)) * newHeight;
+                viewport.width = newWidth;
+                viewport.height = newHeight;
+
+                // Whatever the fit area shows outside the kept region is
+                // exactly the dead margin the crop exists to hide, and only
+                // the scissor blacks it out. Without this an unequal crop
+                // was a visible no-op: the uniform scale comes out at 1.0,
+                // the viewport merely re-centers, and the margins stay on
+                // screen inside the untouched scissor.
+                const int32_t keptLeft = int32_t(lround(viewport.x + (cropL / float(sdSize.x)) * newWidth));
+                const int32_t keptTop = int32_t(lround(viewport.y + (cropT / float(sdSize.y)) * newHeight));
+                const int32_t keptRight = int32_t(lround(viewport.x + ((cropL + keptW) / float(sdSize.x)) * newWidth));
+                const int32_t keptBottom = int32_t(lround(viewport.y + ((cropT + keptH) / float(sdSize.y)) * newHeight));
+                scissor.left = std::max(scissor.left, keptLeft);
+                scissor.top = std::max(scissor.top, keptTop);
+                scissor.right = std::min(scissor.right, keptRight);
+                scissor.bottom = std::min(scissor.bottom, keptBottom);
+            }
+        }
     }
 };

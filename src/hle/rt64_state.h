@@ -30,6 +30,7 @@
 #include "rt64_rdp.h"
 #include "rt64_rsp.h"
 #include "rt64_rdp_tmem.h"
+#include "rt64_snap_photo_detail.h"
 #include "rt64_workload_queue.h"
 
 namespace RT64 {
@@ -72,8 +73,17 @@ namespace RT64 {
         Microcode microcode;
         std::unique_ptr<RSP> rsp;
         std::unique_ptr<RDP> rdp;
+        // Pokemon Snap port: when set, the next G_RDPFULLSYNC draws the
+        // camera focus-indicator dot into the frame before it is synchronized
+        // and presented (replaces the game's CPU write into the RDRAM
+        // framebuffer, which HLE presentation never shows). Set per frame by
+        // the port's send_dl; consumed by GBI_RDP::fullSync.
+        bool snapFocusDotRequest = false;
         TextureManager textureManager;
         FramebufferManager framebufferManager;
+        // Pokemon Snap port: the renders a photo sprite may be halved from,
+        // kept only while userConfig->snapPhotoDetail is on.
+        SnapPhotoDetail snapPhotoDetail;
         FramebufferChangePool scratchFbChangePool;
         std::unique_ptr<FramebufferRenderer> framebufferRenderer;
         RenderTargetManager renderTargetManager;
@@ -162,6 +172,9 @@ namespace RT64 {
         DisplayList *popReturnAddress();
         void setRefreshRate(uint16_t refreshRate);
         void setRenderToRAM(uint8_t renderToRAM);
+        void snapCutHoldCommand();
+        void snapAuthoredStepCommand(uint32_t id);
+        void snapRectGroupCommand(uint32_t id, bool single);
         void setDitherNoiseStrength(float noiseStrength);
         void setExtendedRDRAM(bool isExtended);
         void setTexcoordWrapPoint(int16_t wrapU, int16_t wrapV);

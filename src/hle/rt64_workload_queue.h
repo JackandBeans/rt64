@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <array>
 
 #include "common/rt64_enhancement_configuration.h"
@@ -61,6 +62,18 @@ namespace RT64 {
         };
 
         External ext;
+        // Pokemon Snap port: interpolate the view and projection. This game
+        // carries its camera in the modelview matrices as well, so both
+        // describe the same motion and blending them on separate schedules
+        // makes geometry swim against the view. Toggled at runtime to test
+        // that (F4).
+        //
+        // Atomic because the two sides genuinely overlap: the game thread is
+        // released once the first image of a tick is done, so it writes the next
+        // tick's value while the render thread is still reading this one for the
+        // remaining interpolated sub-frames. Without it a toggle mid-tick splits
+        // that tick between a blended and an unblended view.
+        std::atomic<bool> snapInterpolateCamera = true;
         std::array<Workload, WORKLOAD_QUEUE_SIZE> workloads;
         int threadCursor;
         int writeCursor;
@@ -113,10 +126,17 @@ namespace RT64 {
         void updateMultisampling();
         void threadConfigurationUpdate(hlslpp::uint2 viFbSize, WorkloadConfiguration &workloadConfig);
         void threadConfigurationValidate();
+        bool threadHoldCopy(RenderTarget *srcTarget, const RenderTargetKey &srcKey, RenderTarget *dstTarget, const RenderTargetKey &dstKey);
+        // Snapshot of the previous frame's presented image, taken BEFORE a
+        // cut-transit frame renders: the transit workload's own early passes
+        // (a scene-init clear) can dirty the previous frame's target, and a
+        // hold copied afterwards would present that half-wiped image.
+        std::unique_ptr<RenderTarget> snapHoldScratch;
         void threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
             const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
             float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-            uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts);
+            uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts,
+            bool interpolationSubFrame);
 
         void threadAdvanceBarrier();
         void threadAdvanceWorkloadId(uint64_t newWorkloadId);

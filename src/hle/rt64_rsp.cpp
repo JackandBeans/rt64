@@ -13,7 +13,28 @@
 #include "shared/rt64_rsp_fog.h"
 
 #include "rt64_interpreter.h"
+#include "rt64_snap_diag.h"
 #include "rt64_state.h"
+
+#include <cstdlib>
+#include <unordered_map>
+
+// Pokemon Snap port, diagnostic (SNAP_WIDE_DIAG): which named objects are
+// drawn past the 4:3 picture's side edges, per display list.
+namespace {
+    struct SnapEdgeEntry {
+        float minX = 1e9f;
+        float maxX = -1e9f;
+        float minY = 1e9f;
+        float maxY = -1e9f;
+        int32_t scUlx = 0;
+        int32_t scLrx = 0;
+        uint32_t tris = 0;
+    };
+    const bool snapEdgeDiag = (getenv("SNAP_WIDE_DIAG") != nullptr);
+    std::unordered_map<uint64_t, SnapEdgeEntry> snapEdgeByObject;
+    uint32_t snapEdgeList = 0;
+}
 
 //#define LOG_SPECIAL_MATRIX_OPERATIONS
 
@@ -38,6 +59,18 @@ namespace RT64 {
     }
 
     void RSP::reset() {
+        if (snapEdgeDiag) {
+            for (const auto &kv : snapEdgeByObject) {
+                const SnapEdgeEntry &e = kv.second;
+                if ((e.maxX > 320.0f) || (e.minX < 0.0f)) {
+                    fprintf(stdout, "[SNAP-EDGE] list %u obj %08x img %08x sc %d..%d x %.0f..%.0f y %.0f..%.0f tris %u\n",
+                        snapEdgeList, uint32_t(kv.first >> 32), uint32_t(kv.first & 0xFFFFFFFFu),
+                        e.scUlx, e.scLrx, e.minX, e.maxX, e.minY, e.maxY, e.tris);
+                }
+            }
+            snapEdgeByObject.clear();
+            snapEdgeList++;
+        }
         modelMatrixStackSize = 1;
         projectionMatrixStackSize = 1;
         viewportStackSize = 1;
@@ -507,9 +540,8 @@ namespace RT64 {
         Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
 
         if (extended.modelMatrixIdStackChanged) {
-            const int stackIndex = extended.modelMatrixIdStackSize - 1;
             extended.curModelMatrixIdGroupIndex = int(workload.drawData.transformGroups.size());
-            workload.drawData.transformGroups.emplace_back(extended.modelMatrixIdStack[stackIndex]);
+            workload.drawData.transformGroups.emplace_back(extended.modelMatrixIdStack[extended.modelMatrixIdStackSize - 1]);
             extended.modelMatrixIdStackChanged = false;
         }
         
@@ -544,6 +576,7 @@ namespace RT64 {
         if (addWorldTransform) {
             uint32_t physicalAddress = modelMatrixPhysicalAddressStack[modelMatrixStackSize - 1];
             workload.physicalAddressTransformMap.emplace(physicalAddress, uint32_t(worldTransformGroups.size()));
+
             worldTransformGroups.emplace_back(extended.curModelMatrixIdGroupIndex);
             worldTransformSegmentedAddresses.emplace_back(modelMatrixSegmentedAddressStack[modelMatrixStackSize - 1]);
             worldTransformPhysicalAddresses.emplace_back(physicalAddress);
@@ -841,7 +874,48 @@ namespace RT64 {
         const uint32_t globalIndex = indices[vtxIndex];
         const float screenZ = workload.drawData.posScreen[globalIndex][2] * DepthRange;
         const float zValueFloat = zValue / 65536.0f;
-        if (forceBranch || (screenZ < zValueFloat)) {
+
+        // Pokemon Snap port: this comparison decides whether a model part is
+        // drawn at all -- every part in this game sits behind a near-else-far
+        // pair of these branches, and one that fails both tests vanishes.
+        // The RSP computes the vertex's screen z through its fixed-point
+        // pipeline; this float reconstruction lands close but not identically,
+        // and a part sitting at the limit resolves the tie differently than
+        // the hardware did: measured on the beach, a model at z 1020.5
+        // against a limit of 1020.11 stayed refused for 27 straight frames
+        // that the console drew, holding it invisible until the cart got
+        // close enough to pop it into view.
+        //
+        // The margin biases the tie toward drawing, sized to the measurement:
+        // the one drift case ever captured was 0.39 units, so one full unit
+        // covers it with headroom while staying far below any authored gap. A
+        // scaled margin (0.5% of the limit, ~5.6 units at the far horizon)
+        // was tried and taken back out: it exceeded every measured drift by
+        // an order of magnitude, which crosses from correcting this port's
+        // arithmetic into drawing what the hardware never drew. The refusal
+        // log's wider spread (refusals up to eighteen units from the limit)
+        // is the authored appearance distance itself -- the console refused
+        // those too -- so no margin should reach it. Opening these gates
+        // outright was also tried and rejected for the same reason: it would
+        // draw distant Pokemon the hardware never drew, a visible deviation.
+        constexpr float SnapBranchZMargin = 1.0f;
+        const bool taken = forceBranch || (screenZ < zValueFloat + SnapBranchZMargin);
+
+        // The refusal probe: a taken branch is routine, a refusal is the
+        // interesting event.
+        if (!taken && snapdiag::diagEnabled()) {
+            static uint32_t refusals = 0;
+            refusals++;
+            if ((refusals <= 2000) || ((refusals % 100) == 0)) {
+                fprintf(stdout, "[SNAP-BRZ] #%u dl %08X vtx %u z %.2f limit %.2f\n",
+                    refusals, branchDl, vtxIndex, screenZ, zValueFloat);
+                if ((refusals % 32) == 0) {
+                    fflush(stdout);
+                }
+            }
+        }
+
+        if (taken) {
             const uint32_t rdramAddress = fromSegmentedMasked(branchDl);
             *dl = reinterpret_cast<DisplayList *>(state->fromRDRAM(rdramAddress)) - 1;
         }
@@ -853,7 +927,12 @@ namespace RT64 {
         const Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
         const uint32_t globalIndex = indices[vtxIndex];
         const float posW = workload.drawData.posTransformed[globalIndex][3];
-        if (forceBranch || (posW < static_cast<float>(wValue))) {
+        // No margin here, deliberately. This opcode is only mapped for the
+        // F3DZEX2 microcodes, which this game does not run, and no drift was
+        // ever measured on this path -- posW is linear clip-space W with
+        // float error orders of magnitude below one unit. A margin copied
+        // from branchZ by analogy would bias a comparison nothing calibrated.
+        if (forceBranch || (posW < float(wValue))) {
             const uint32_t rdramAddress = fromSegmentedMasked(branchDl);
             *dl = reinterpret_cast<DisplayList *>(state->fromRDRAM(rdramAddress)) - 1;
         }
@@ -1075,6 +1154,19 @@ namespace RT64 {
         // Check if the texture needs to be updated.
         auto &drawCall = state->drawCall;
         if ((drawCall.textureOn != textureState.on) || (drawCall.textureTile != textureState.tile) || (drawCall.textureLevels != textureState.levels)) {
+            // Pokemon Snap port: the triangles still pending were drawn under
+            // the texture state the call holds now, and they are recorded
+            // with it before the new state replaces it. Written in place
+            // before the flush, the recorded copy of the last call before
+            // every texture change carried the NEXT call's state: untextured
+            // triangles followed by a textured part read as textured. The
+            // renderer never reads the recorded field, but the Jynx recolour
+            // (render/rt64_snap_recolor.h) asks it whether the texture was
+            // off, and missed the face whenever a textured part came next --
+            // the far and viewfinder models end their face with the display
+            // list. Flushing here is what checkDrawState does a few lines
+            // down; it only happens earlier, with the call still whole.
+            state->flush();
             drawCall.textureOn = textureState.on;
             drawCall.textureTile = textureState.tile;
             drawCall.textureLevels = textureState.levels;
@@ -1119,6 +1211,33 @@ namespace RT64 {
 
         // Indicates the vertex has been used in a tri. Whatever routines modify the vertex afterwards must use a new index instead.
 
+        if (snapEdgeDiag) {
+            const auto &groups = workload.drawData.transformGroups;
+            const auto &worldGroups = workload.drawData.worldTransformGroups;
+            const uint32_t worldIdx = worldIndices[globalIndices[0]];
+            uint32_t objectId = 0;
+            if (worldIdx < worldGroups.size() && worldGroups[worldIdx] < groups.size()) {
+                const TransformGroup &g = groups[worldGroups[worldIdx]];
+                objectId = (g.coherenceId != 0) ? g.coherenceId : g.matrixId;
+            }
+            if (objectId != 0) {
+                const uint32_t imgAddr = state->rdp->colorImage.address;
+                SnapEdgeEntry &e = snapEdgeByObject[(uint64_t(objectId) << 32) | imgAddr];
+                const FixedRect &sc = state->rdp->scissorRectStack[state->rdp->scissorStackSize - 1];
+                e.scUlx = sc.ulx / 4;
+                e.scLrx = sc.lrx / 4;
+                for (int i = 0; i < 3; i++) {
+                    const float x = posScreen[globalIndices[i]].x;
+                    const float y = posScreen[globalIndices[i]].y;
+                    e.minX = std::min(e.minX, x);
+                    e.maxX = std::max(e.maxX, x);
+                    e.minY = std::min(e.minY, y);
+                    e.maxY = std::max(e.maxY, y);
+                }
+                e.tris++;
+            }
+        }
+
         for (int i = 0; i < 3; i++) {
             // TODO: Figure out how to handle texcoord tracking on TEXGEN cases.
             const uint32_t globalIndex = globalIndices[i];
@@ -1128,9 +1247,39 @@ namespace RT64 {
             maxMatrix = std::max(maxMatrix, worldIndices[globalIndex]);
         }
 
+        // Pokemon Snap port: the fitted box and the facing test below are read
+        // off posScreen, which is xyz / w with no clipping (readVertices). For
+        // a vertex at or behind the camera plane (w <= 0) that is not where
+        // the vertex lands: the divide flips it through the picture's centre
+        // and sends it far off, so a triangle that straddles the plane gets a
+        // box that lies anywhere and a winding that is a coin toss; and a
+        // vertex a hair in front projects to a coordinate the int32 casts
+        // below cannot hold, which makes an inverted box that merges nothing.
+        // The RSP clips such a triangle and the RDP draws what remains. Here
+        // it was judged back-facing, or its box missed the viewport, and a
+        // pass made only of such triangles -- a Pokemon filling the bottom of
+        // the picture with the camera pitched up at it, Snorlax on the Beach
+        // -- had an empty fitted box and was dropped whole by the selection
+        // gates (rt64_workload_queue.cpp), so it vanished until the camera
+        // came back down. Such a triangle is taken as visible and as covering
+        // the scissor: its extent is unknowable before clipping, and the
+        // scissor is the bound the RDP draws against. Drawing itself is not
+        // touched; the GPU clips the triangle as it always did.
+        bool unprojectable = false;
+        for (int i = 0; i < 3; i++) {
+            const hlslpp::float4 &t = workload.drawData.posTransformed[globalIndices[i]];
+            const hlslpp::float3 &s = posScreen[globalIndices[i]];
+            // 4096 pixels each way is far past any framebuffer; squared so a
+            // NaN fails the test too.
+            if ((t[3] <= 0.0f) || !(s[0] * s[0] < 16777216.0f) || !(s[1] * s[1] < 16777216.0f)) {
+                unprojectable = true;
+                break;
+            }
+        }
+
         bool visibleTri = true;
         const bool usesCulling = geometryMode & cullBothMask;
-        if (usesCulling) {
+        if (usesCulling && !unprojectable) {
             const hlslpp::float3 U = posScreen[globalIndices[1]] - posScreen[globalIndices[0]];
             const hlslpp::float3 V = posScreen[globalIndices[2]] - posScreen[globalIndices[0]];
             const hlslpp::float3 N = hlslpp::cross(V, U);
@@ -1142,12 +1291,17 @@ namespace RT64 {
             fbPair.scissorRect.merge(scissorRect);
 
             FixedRect drawRect;
-            for (int i = 0; i < 3; i++) {
-                const hlslpp::float3 &v = posScreen[globalIndices[i]];
-                drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
-                drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
-                drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
-                drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
+            if (unprojectable) {
+                drawRect = scissorRect;
+            }
+            else {
+                for (int i = 0; i < 3; i++) {
+                    const hlslpp::float3 &v = posScreen[globalIndices[i]];
+                    drawRect.ulx = std::min(drawRect.ulx, int32_t(v[0] * 4.0f));
+                    drawRect.uly = std::min(drawRect.uly, int32_t(v[1] * 4.0f));
+                    drawRect.lrx = std::max(drawRect.lrx, int32_t(hlslpp::ceil(v.x).x * 4.0f));
+                    drawRect.lry = std::max(drawRect.lry, int32_t(hlslpp::ceil(v.y).x * 4.0f));
+                }
             }
 
             const interop::RSPViewport &viewport = viewportStack[viewportStackSize - 1];
@@ -1192,7 +1346,7 @@ namespace RT64 {
         state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
     }
 
-    void RSP::matrixId(uint32_t id, bool push, bool proj, bool decompose, uint8_t pos, uint8_t rot, uint8_t scale, uint8_t skew, uint8_t persp, uint8_t vpos, uint8_t vtc, uint8_t tile, uint8_t lookat, uint8_t order, uint8_t aspect, uint8_t editable, bool idIsAddress, bool editGroup) {
+    void RSP::matrixId(uint32_t id, bool push, bool proj, bool decompose, uint8_t pos, uint8_t rot, uint8_t scale, uint8_t skew, uint8_t persp, uint8_t vpos, uint8_t vtc, uint8_t tile, uint8_t lookat, uint8_t order, uint8_t aspect, uint8_t editable, bool idIsAddress, bool editGroup, uint32_t coherenceId) {
         assert((idIsAddress == editGroup) && "This case is not supported yet.");
 
         auto setGroupProperties = [=](TransformGroup* dstGroup, bool newGroup) {
@@ -1210,6 +1364,7 @@ namespace RT64 {
                 dstGroup->ordering = order;
                 dstGroup->aspectMode = aspect;
                 dstGroup->editable = editable;
+                dstGroup->coherenceId = coherenceId;
             }
         };
 

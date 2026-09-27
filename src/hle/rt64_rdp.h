@@ -93,6 +93,11 @@ namespace RT64 {
                 ExtendedAlignment rect;
                 ExtendedAlignment scissor;
                 uint8_t rectAspect;
+                // Pokemon Snap port: the 2D element the next rectangles belong
+                // to, and how many of them it has drawn so far this group.
+                uint32_t snapRectId;
+                uint32_t snapRectOrdinal;
+                bool snapRectSingle;
             } global;
 
             uint16_t scissorLeftOriginStack[RDP_EXTENDED_STACK_SIZE];

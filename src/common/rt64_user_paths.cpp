@@ -20,6 +20,9 @@ namespace RT64 {
     const std::filesystem::path ConfigurationFile = "rt64.json";
     const std::filesystem::path ImGuiFile = "rt64-imgui.ini";
     const std::filesystem::path LogFile = "rt64.log";
+    const std::filesystem::path ShaderCacheFile = "shadercache.bin";
+    const std::filesystem::path PipelineCacheFile = "pipelinecache.bin";
+    const std::filesystem::path PipelineCacheMarkerFile = "pipelinecache.inuse";
 
     std::filesystem::path UserPaths::detectDataPath(const std::filesystem::path &appId) {
         std::filesystem::path resultPath;
@@ -67,6 +70,9 @@ namespace RT64 {
             configurationPath = dataPath / ConfigurationFile;
             imguiPath = dataPath / ImGuiFile;
             logPath = dataPath / LogFile;
+            shaderCachePath = dataPath / ShaderCacheFile;
+            pipelineCachePath = dataPath / PipelineCacheFile;
+            pipelineCacheMarkerPath = dataPath / PipelineCacheMarkerFile;
         }
     }
 

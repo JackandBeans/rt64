@@ -5,8 +5,22 @@
 #include "rt64_application.h"
 #include "rhi/rt64_render_hooks.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <filesystem>
+#include <fstream>
+
+#include "rt64_snap_diag.h"
+
+// Pipelines the driver reused versus built (contrib/plume/plume_d3d12.cpp).
+extern "C" std::atomic<uint32_t> snap_pipeline_reused;
+extern "C" std::atomic<uint32_t> snap_pipeline_built;
+#if !defined(_WIN32)
+// Only the Direct3D 12 backend counts; the Vulkan and Metal backends leave
+// both at zero, and the log line below reports them as such.
+extern "C" std::atomic<uint32_t> snap_pipeline_reused{0};
+extern "C" std::atomic<uint32_t> snap_pipeline_built{0};
+#endif
 
 #include "common/rt64_dynamic_libraries.h"
 #include "common/rt64_elapsed_timer.h"
@@ -237,7 +251,14 @@ namespace RT64 {
                 const uint64_t BrokenRDNA4DriverD3D12 = 0x200000794103EC; // Aug 2026
                 const bool isRX90 = deviceDescription.name.find("AMD Radeon RX 90") != std::string::npos;
                 const bool isRDNA4 = isRX90;
-                if ((deviceDescription.driverVersion <= BrokenAMDDriverD3D12) || (isRDNA4 && (deviceDescription.driverVersion <= BrokenRDNA4DriverD3D12))) {
+                // Pokemon Snap port: upstream also forces Vulkan for RDNA4 up to
+                // BrokenRDNA4DriverD3D12 whatever the player chose (#265). This
+                // port's suite and a full playthrough ran on an RX 9060 XT at
+                // exactly that driver in D3D12 without the fault, and the API
+                // is the player's choice on the Graphics page; the RDNA4
+                // clause is kept to Automatic mode.
+                (void)BrokenRDNA4DriverD3D12;
+                if (deviceDescription.driverVersion <= BrokenAMDDriverD3D12) {
                     forceVulkanForCompatibility = true;
                 }
                 else if (automaticGraphicsAPI) {
@@ -350,6 +371,79 @@ namespace RT64 {
             userConfig.antialiasing = UserConfiguration::Antialiasing::None;
         }
 
+        // Hand the driver back the pipelines it built on earlier runs. This has
+        // to happen before the first pipeline of any kind is created, which the
+        // shader library below does.
+        //
+        // Caching the shader bytecode removed the compile; what remained was the
+        // driver turning that bytecode into a pipeline, which only the driver can
+        // skip. Measured while playing, thirty-seven of those still happened
+        // mid-course and landed inside stalls of thirty and forty milliseconds.
+        //
+        // An opaque driver blob is the one thing here that can take a driver down,
+        // so a breadcrumb is written before it is handed over and removed on a
+        // clean shutdown. Finding it already there means the last run that used
+        // this file did not survive, and the file is discarded rather than handed
+        // over a second time. The cost of being wrong is one warm-up.
+        if (!userPaths.isEmpty()) {
+            std::error_code markerError;
+            if (std::filesystem::exists(userPaths.pipelineCacheMarkerPath, markerError)) {
+                fprintf(stdout, "[SNAP-SHADER] discarding the driver pipeline cache: the previous run did not shut down cleanly\n");
+                std::filesystem::remove(userPaths.pipelineCachePath, markerError);
+                std::filesystem::remove(userPaths.pipelineCacheMarkerPath, markerError);
+            }
+
+            devicePipelineCache = std::make_unique<ShaderBlobCache>();
+            // Saved as the run goes rather than only at shutdown. The pipelines
+            // are worth nothing to a player who closes the game any way other
+            // than the one that happens to run the shutdown path, and worth
+            // nothing at all after a crash. Only asked for when the driver has
+            // actually built something new, and only on the cache's own thread.
+            RenderDevice *cacheDevice = device.get();
+            const std::filesystem::path markerPath = userPaths.pipelineCacheMarkerPath;
+            devicePipelineCache->refresh = [cacheDevice, markerPath](uint64_t &key, std::vector<uint8_t> &data) {
+                // The breadcrumb guards against a blob the driver cannot survive,
+                // and a driver that cannot survive one says so while it is building
+                // its first pipelines, not minutes into a course. Once the run has
+                // got this far the blob is proven, so the breadcrumb comes off --
+                // otherwise every later crash, for any unrelated reason, would
+                // throw away a cache that had nothing to do with it.
+                static bool markerCleared = false;
+                if (!markerCleared) {
+                    markerCleared = true;
+                    std::error_code markerError;
+                    std::filesystem::remove(markerPath, markerError);
+                }
+
+                static uint32_t lastBuilt = 0;
+                const uint32_t built = snap_pipeline_built.load(std::memory_order_relaxed);
+                if (built == lastBuilt) {
+                    return false;
+                }
+
+                lastBuilt = built;
+                key = ShaderBlobCache::DriverBlobKey;
+                data = cacheDevice->getPipelineCacheData();
+                return !data.empty();
+            };
+            devicePipelineCache->open(userPaths.pipelineCachePath, device.get());
+
+            ShaderBlobCache::Blob driverBlob = devicePipelineCache->lookup(ShaderBlobCache::DriverBlobKey);
+            const bool hadBlob = (driverBlob != nullptr) && !driverBlob->empty();
+            if (hadBlob) {
+                std::ofstream marker(userPaths.pipelineCacheMarkerPath, std::ios::binary | std::ios::trunc);
+                marker.close();
+            }
+
+            const bool accepted = device->setPipelineCacheData(
+                hadBlob ? driverBlob->data() : nullptr,
+                hadBlob ? driverBlob->size() : 0);
+            if (hadBlob && !accepted) {
+                // Nothing was consumed, so the breadcrumb comes back off.
+                std::filesystem::remove(userPaths.pipelineCacheMarkerPath, markerError);
+            }
+        }
+
         // Create the shader library.
         const RenderMultisampling multisampling = RasterShader::generateMultisamplingPattern(userConfig.msaaSampleCount(), device->getCapabilities().sampleLocations);
         shaderLibrary = std::make_unique<ShaderLibrary>(usesHDR, usesHardwareResolve);
@@ -363,6 +457,13 @@ namespace RT64 {
         const uint32_t ubershaderThreads = uint32_t(std::max(int(threadsAvailable) - 2, 1));
         rasterShaderCache = std::make_unique<RasterShaderCache>(rasterShaderThreads, ubershaderThreads);
         rasterShaderCache->setup(device.get(), renderInterface->getCapabilities().shaderFormat, shaderLibrary.get(), multisampling);
+        rasterShaderCache->openBlobCache(userPaths.isEmpty() ? std::filesystem::path() : userPaths.shaderCachePath);
+        // Pokemon Snap port: warm every shader this machine has ever seen,
+        // during boot on the idle compile workers, so a Pokemon's first
+        // steps on screen never pay for pipeline creation.
+        if (!userPaths.isEmpty()) {
+            rasterShaderCache->openSeenList(userPaths.shaderCachePath.parent_path() / "rt64-seen-shaders.bin");
+        }
 
 #   if RT_ENABLED
         if (device->getCapabilities().raytracing) {
@@ -654,16 +755,26 @@ namespace RT64 {
 
             break;
         }
+        // Pokemon Snap port: gated like the inspector. These shortcuts share
+        // F2-F4 with the port's own settings hotkeys, and outside developer
+        // mode a player toggling a port setting must not also flip debug
+        // state -- F3 was presenting the raw RDRAM view.
         case DeveloperShortcut::RayTracing: {
-            workloadQueue->rtEnabled = !workloadQueue->rtEnabled;
+            if (userConfig.developerMode) {
+                workloadQueue->rtEnabled = !workloadQueue->rtEnabled;
+            }
             break;
         }
         case DeveloperShortcut::ViewRDRAM: {
-            presentQueue->viewRDRAM = !presentQueue->viewRDRAM;
+            if (userConfig.developerMode) {
+                presentQueue->viewRDRAM = !presentQueue->viewRDRAM;
+            }
             break;
         }
         case DeveloperShortcut::Replacements: {
-            textureCache->textureMap.replacementMapEnabled = !textureCache->textureMap.replacementMapEnabled;
+            if (userConfig.developerMode) {
+                textureCache->textureMap.replacementMapEnabled = !textureCache->textureMap.replacementMapEnabled;
+            }
             break;
         }
         default:
@@ -695,7 +806,29 @@ namespace RT64 {
         workloadVelocityUploader.reset();
         workloadTilesUploader.reset();
         sharedQueueResources.reset();
+        // Destroying the shader cache joins every compilation thread, so past
+        // this line no pipeline is being created and the driver's store can be
+        // read without a question about concurrency.
         rasterShaderCache.reset();
+
+        if (devicePipelineCache != nullptr) {
+            if (snapdiag::diagEnabled() || snapdiag::statsEnabled()) {
+                fprintf(stdout, "[SNAP-SHADER] driver pipelines: %u reused from earlier runs, %u built this run\n",
+                    snap_pipeline_reused.load(std::memory_order_relaxed),
+                    snap_pipeline_built.load(std::memory_order_relaxed));
+                fflush(stdout);
+            }
+
+            const std::vector<uint8_t> driverBlob = device->getPipelineCacheData();
+            if (!driverBlob.empty()) {
+                devicePipelineCache->store(ShaderBlobCache::DriverBlobKey, driverBlob.data(), driverBlob.size());
+            }
+
+            devicePipelineCache.reset();
+
+            std::error_code markerError;
+            std::filesystem::remove(userPaths.pipelineCacheMarkerPath, markerError);
+        }
 #   if RT_ENABLED
         rtShaderCache.reset();
         blueNoiseTexture.texture.reset();

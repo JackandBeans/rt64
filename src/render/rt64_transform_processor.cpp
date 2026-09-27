@@ -34,14 +34,27 @@ namespace RT64 {
             hlslpp::float4x4 prevMatrix, curMatrix, invMatrix, invTMatrix;
 
             // Match with the previous frame and interpolate the transforms.
+            // Cutscene content interpolates like everything else: pinning it
+            // to the current frame was tried and reads as the whole intro
+            // running at half rate. What the film's staged ticks need is not
+            // stepping but absence -- the workload queue holds them off
+            // screen entirely, and the pose guard plus its
+            // hysteresis keep any shown pair from blending across a re-pose.
             if (prevFrameValid) {
                 const GameFrameMap::WorkloadMap &workloadMap = p.curFrame->frameMap.workloads[w];
                 const DrawData &prevDrawData = p.workloadQueue->workloads[workloadMap.prevWorkloadIndex].drawData;
+
                 for (size_t t = 0; t < drawData.worldTransforms.size(); t++) {
                     const GameFrameMap::TransformMap &transformMap = workloadMap.transforms[t];
                     if (transformMap.mapped) {
-                        const hlslpp::float4x4 &prevTransform = prevDrawData.worldTransforms[workloadMap.transforms[t].prevTransformIndex];
+                        hlslpp::float4x4 prevTransform = prevDrawData.worldTransforms[workloadMap.transforms[t].prevTransformIndex];
                         const hlslpp::float4x4 &curTransform = drawData.worldTransforms[t];
+
+                        // Matching decided this one reads correctly in the new
+                        // origin, so move it the same way before interpolating.
+                        if (transformMap.snapRebasedPrev) {
+                            prevTransform[3].xyz = prevTransform[3].xyz + p.curFrame->snapOriginDelta;
+                        }
                         prevMatrix = transformMap.rigidBody.lerp(p.prevFrameWeight, prevTransform, curTransform, true);
                         curMatrix = transformMap.rigidBody.lerp(p.curFrameWeight, prevTransform, curTransform, true);
                         invMatrix = hlslpp::inverse(curMatrix);
@@ -74,9 +87,17 @@ namespace RT64 {
         uploads.clear();
 
         for (uint32_t w : p.curFrame->workloads) {
-            const bool prevFrameValid = (p.prevFrame != nullptr);
             Workload &workload = p.workloadQueue->workloads[w];
             const DrawData &drawData = workload.drawData;
+            // process() only fills the lerp and prev vectors when the workload
+            // is mapped to one in the previous frame; otherwise it clears them
+            // and fills nothing. Testing prevFrame alone, as this did, then
+            // hands the GPU an empty vector's data while asking it to read a
+            // matrix per world transform, so an unmapped workload uploads
+            // whatever happens to follow in memory as its world matrices.
+            // Geometry warps and sinks through the scene for that frame, and
+            // unmapped workloads are routine while the view is changing.
+            const bool prevFrameValid = (p.prevFrame != nullptr) && !drawData.lerpWorldTransforms.empty();
             DrawBuffers &drawBuffers = workload.drawBuffers;
             const interop::float4x4 *worldMatrices = prevFrameValid ? drawData.lerpWorldTransforms.data() : drawData.worldTransforms.data();
             const interop::float4x4 *prevWorldMatrices = prevFrameValid ? drawData.prevWorldTransforms.data() : drawData.worldTransforms.data();

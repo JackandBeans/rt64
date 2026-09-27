@@ -80,7 +80,20 @@
 #define G_EX_SETVERTEXSEGMENT_V1        0x000031
 #define G_EX_SETTEXCOORDWRAPPOINT_V1    0x000032
 #define G_EX_SETRECTASPECT_V1           0x000033
-#define G_EX_MAX                        0x000034
+#define G_EX_AUTHOREDSTEP_V1        0x000034
+// Pokemon Snap port: names the 2D element the rectangles that follow belong
+// to, so the renderer can find that element in the previous frame and move
+// it between the two. An id of zero closes the group; a rectangle drawn
+// outside one is never paired and lands exactly where the game put it.
+#define G_EX_RECTGROUP_V1           0x000035
+// A group of exactly one rectangle. The first rectangle after this command
+// takes the id and the group closes itself; a second rectangle before any new
+// command is explicitly unnamed rather than misattributed. Built for particles,
+// where a declined tag otherwise let the next particle's rectangle fall into
+// the previous particle's still-open group and pair across frames with
+// whichever particle happened to follow.
+#define G_EX_RECTGROUP_ONE_V1       0x000036
+#define G_EX_MAX                        0x000037
 
 #define G_EX_ORIGIN_NONE            0x800
 #define G_EX_ORIGIN_LEFT            0x0
@@ -423,6 +436,40 @@ typedef union {
     G_EX_COMMAND1(cmd, \
         PARAM(RT64_EXTENDED_OPCODE, 8, 24) | PARAM(G_EX_POPSCISSOR_V1, 24, 0), \
         0 \
+    )
+
+// Pokemon Snap port: names the rectangles that follow so the renderer can pair
+// them with the same element's rectangles in the previous frame. An id of 0
+// closes the group; nothing after it carries a name until the next group opens.
+//
+// Each tag carries its own enable prefix, exactly like the port's C++-side
+// taggers (src/fx_tags.cpp, src/rect_tags.cpp), because a bare extended opcode
+// is only parsed after something has enabled the extension for the current
+// walk -- and the border pass sits at the very top of the display list, ahead
+// of the camera setup that otherwise turns it on. A tag that depends on its
+// position in the frame is a tag that silently stops working when the frame is
+// rearranged; this one carries everything it needs.
+#define gEXRectGroup(cmd, id) \
+    G_EX_COMMAND2(cmd, \
+        PARAM(RT64_HOOK_OPCODE, 8, 24) | PARAM(RT64_HOOK_MAGIC_NUMBER, 24, 0), \
+        PARAM(RT64_HOOK_OP_ENABLE, 4, 28) | PARAM(RT64_EXTENDED_OPCODE, 8, 0), \
+        \
+        PARAM(RT64_EXTENDED_OPCODE, 8, 24) | PARAM(G_EX_RECTGROUP_V1, 24, 0), \
+        (id) \
+    )
+
+// The self-closing form: exactly one rectangle takes the name, then the group
+// ends by itself. The right tool when a rectangle can independently fail to be
+// emitted (a degenerate size is silently dropped) -- with an open group that
+// silent drop shifts every later ordinal and refuses the whole element; with
+// one name per rectangle only the missing one goes unpaired.
+#define gEXRectGroupOne(cmd, id) \
+    G_EX_COMMAND2(cmd, \
+        PARAM(RT64_HOOK_OPCODE, 8, 24) | PARAM(RT64_HOOK_MAGIC_NUMBER, 24, 0), \
+        PARAM(RT64_HOOK_OP_ENABLE, 4, 28) | PARAM(RT64_EXTENDED_OPCODE, 8, 0), \
+        \
+        PARAM(RT64_EXTENDED_OPCODE, 8, 24) | PARAM(G_EX_RECTGROUP_ONE_V1, 24, 0), \
+        (id) \
     )
 
 #define gEXPushOtherMode(cmd) \

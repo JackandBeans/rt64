@@ -46,8 +46,11 @@ float sampleBackgroundDepth(int2 pixelPos, uint sampleCount) {
 #endif
 
 LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float2 vertexUV, float4 vertexSmoothColor, float4 vertexFlatColor,
-    bool isFrontFace, out float4 resultColor, out float4 resultAlpha) 
+    bool isFrontFace, out float4 resultColor, out float4 resultAlpha, out float resultDepth) 
 {
+    // Defined on every path out of here, including the ones that return false.
+    resultDepth = vertexPosition.z;
+
     const OtherMode otherMode = { rp.omL, rp.omH };
 #if defined(DYNAMIC_RENDER_PARAMS)
     if ((otherMode.cycleType() != G_CYC_COPY) && renderFlagCulling(rp.flags) && isFrontFace) {
@@ -61,6 +64,10 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     const bool depthClampNear = renderFlagNoN(rp.flags);
     const bool depthDecal = (otherMode.zMode() == ZMODE_DEC);
     const bool zSourcePrim = (otherMode.zSource() == G_ZS_PRIM);
+    // Pokemon Snap port: a G_ZS_PRIM draw carries its depth in the per-call
+    // parameters and is rasterised at the near plane (RasterVS); the depth
+    // this fragment clips, compares and writes with is the primitive's.
+    const float fragDepth = (zSourcePrim && (otherMode.cycleType() != G_CYC_COPY)) ? instanceRDPParams[instanceIndex].primDepth.x : vertexPosition.z;
     int2 pixelPosSeed = floor(vertexPosition.xy);
     uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
 
@@ -77,16 +84,24 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     // Handle no-nearclipping by clamping the minimum depth and manually clipping above the maximum.
     if (depthClampNear) {
         // Since depth clip is disabled on the PSO so near clip can be ignored, we manually clip any values above the allowed depth.
-        if (vertexPosition.z > MaxDepth) {
+        if (fragDepth > MaxDepth) {
             return false;
         }
     }
     // Do depth clipping manually on the fragment shader if pipeline's depth bounds are not being used due to lack of hardware support.
     else if (!pipelineDepthBounds) {
-        if ((vertexPosition.z < 0.0f) || (vertexPosition.z > MaxDepth)) {
+        if ((fragDepth < 0.0f) || (fragDepth > MaxDepth)) {
             return false;
         }
     }
+
+    // Quantise the depth this fragment writes onto the hardware's grid. This has to happen after
+    // the clipping above, which must keep testing the raw interpolated value (or, for a G_ZS_PRIM
+    // draw, the primitive depth read above) because the hardware
+    // clips before it encodes, and after interpolation, which is the only point at which the
+    // hardware quantises at all. Snapping per vertex instead flattens the depth gradient across
+    // large polygons and loses the geometry entirely.
+    resultDepth = QuantizeDepthN64(fragDepth);
 
     if (depthDecal) {
         // Sample the depth buffer for this pixel to compare for the decal check.
@@ -105,7 +120,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
 
         // Perform the decal depth tolerance check.
         const float DepthTolerance = max(CoplanarDepthTolerance(surfaceDepth), dz);
-        const float pixelDepth = select(depthClampNear, max(vertexPosition.z, 0.0f), vertexPosition.z);
+        const float pixelDepth = select(depthClampNear, max(fragDepth, 0.0f), fragDepth);
         if (abs(pixelDepth - surfaceDepth) > DepthTolerance) {
             return false;
         }
@@ -171,7 +186,16 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
     ccInputs.alphaOnly = false;
     ccInputs.texVal0 = texVal0;
     ccInputs.texVal1 = texVal1;
-    ccInputs.primColor = instanceRDPParams[instanceIndex].primColor;
+    // Pokemon Snap port: a primitive colour the game stepped between the two
+    // matched frames is blended by the sub-frame's weight, so a fade the
+    // game moves once per frame moves once per image (hle/rt64_game_frame.cpp,
+    // GameFrame::snapMatchPrimColors).
+    float4 primColor = instanceRDPParams[instanceIndex].primColor;
+    if (instanceRDPParams[instanceIndex].snapPrimBlend > 0.5f) {
+        primColor = lerp(instanceRDPParams[instanceIndex].snapPrevPrimColor, primColor, FbParams.snapPrimWeight);
+    }
+
+    ccInputs.primColor = primColor;
     ccInputs.shadeColor = shadeColor;
     ccInputs.envColor = instanceRDPParams[instanceIndex].envColor;
     ccInputs.keyCenter = instanceRDPParams[instanceIndex].keyCenter;
@@ -237,8 +261,17 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
         resultAlpha.a = resultColor.a;
     }
     
+    // Copy mode skips the coverage pipeline along with the combiner and blender: the RDP writes the
+    // fetched texel's bits into the framebuffer verbatim, so the low bit of a 16-bit pixel is the
+    // texel's alpha bit, not a coverage bit. The combiner and blender passed that alpha through
+    // untouched above, and Float4ToRGBA16 stores an alpha of exactly 1.0 or 0.0 as that bit the same
+    // way it stores a pixel read back from memory, so keep it. The coverage encodings below would
+    // replace it with a value that has no meaning in this mode.
+    if (otherMode.cycleType() == G_CYC_COPY) {
+        resultColor.a = combinerColor.a;
+    }
     // Preserve the value in the destination.
-    if (otherMode.cvgDst() == CVG_DST_SAVE) {
+    else if (otherMode.cvgDst() == CVG_DST_SAVE) {
         resultColor.a = 0.0f;
     }
     // Write a full coverage value regardless of the computed coverage.
@@ -281,7 +314,9 @@ RenderParams getRenderParams() {
 
 #if defined(DYNAMIC_RENDER_PARAMS) || defined(SPEC_CONSTANT_RENDER_PARAMS)
 void PSMain(
-      in float4 vertexPosition : SV_POSITION
+      // noperspective centroid is required, not stylistic: writing SV_DepthGreaterEqual from a
+      // shader that reads SV_POSITION is a DXIL validation error without it.
+      noperspective centroid in float4 vertexPosition : SV_POSITION
     , in float2 vertexUV : TEXCOORD
     , in float4 vertexSmoothColor : COLOR0
 #if defined(DYNAMIC_RENDER_PARAMS) || defined(VERTEX_FLAT_COLOR)
@@ -292,6 +327,7 @@ void PSMain(
 #endif
     , [[vk::location(0)]] [[vk::index(0)]] out float4 pixelColor : SV_TARGET0
     , [[vk::location(0)]] [[vk::index(1)]] out float4 pixelAlpha : SV_TARGET1
+    , out float pixelDepth : SV_DepthGreaterEqual
 )
 {
 #if !defined(DYNAMIC_RENDER_PARAMS)
@@ -303,11 +339,12 @@ void PSMain(
     float4 resultColor;
     float4 resultAlpha;
     float resultDepth;
-    if (!RasterPS(getRenderParams(), vertexPosition, vertexUV, vertexSmoothColor, vertexFlatColor, isFrontFace, resultColor, resultAlpha)) {
+    if (!RasterPS(getRenderParams(), vertexPosition, vertexUV, vertexSmoothColor, vertexFlatColor, isFrontFace, resultColor, resultAlpha, resultDepth)) {
         discard;
     }
 
     pixelColor = resultColor;
     pixelAlpha = resultAlpha;
+    pixelDepth = resultDepth;
 }
 #endif

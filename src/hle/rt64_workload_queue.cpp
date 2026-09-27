@@ -2,13 +2,27 @@
 // RT64
 //
 
+#include <algorithm>
 #include "rt64_workload_queue.h"
+
+#include <cstdlib>
 
 #include "common/rt64_thread.h"
 
 #include "rt64_present_queue.h"
 
 #define ENABLE_HIGH_RESOLUTION_RENDERER 1
+
+#include "rt64_snap_diag.h"
+
+#include <atomic>
+#include <chrono>
+
+// Pokemon Snap port: defined in src/frame_dump.cpp on the game side. Setting
+// it asks the game to save the next few frames' framebuffers as images.
+// Atomic: armed here on the render thread, consumed on the game thread, read
+// by the present queue.
+extern "C" std::atomic<int32_t> snap_frame_dump_pending;
 
 namespace RT64 {
     // WorkloadQueue
@@ -204,6 +218,26 @@ namespace RT64 {
             break;
         }
 
+        // The ceiling applies to whatever the mode produced, so a capped
+        // window scale and a capped manual value behave the same.
+        const float resolutionCap = float(ext.sharedResources->userConfig.resolutionMultiplierCap);
+        if (resolutionCap > 0.0f) {
+            resolutionMultiplier = std::min(resolutionMultiplier, resolutionCap);
+        }
+
+        // Supersampling: the downsample divides at present time, so the
+        // render has to happen that much above the presented scale or the
+        // picture ends up BELOW the window's resolution and stretches back
+        // up as blur. Applied after the cap -- the cap bounds the presented
+        // resolution, and supersampling is an explicit request to render
+        // beyond it -- and bounded by the same overall limit as everything
+        // else so an extreme combination cannot ask for absurd targets.
+        const int ssaa = ext.sharedResources->userConfig.downsampleMultiplier;
+        if (ssaa > 1) {
+            resolutionMultiplier = std::min(resolutionMultiplier * float(ssaa),
+                                            float(UserConfiguration::ResolutionMultiplierLimit));
+        }
+
         uint32_t msaaSampleCount = ext.sharedResources->userConfig.msaaSampleCount();
 
         // Build the resolution scale vector from the configuration.
@@ -289,13 +323,96 @@ namespace RT64 {
         }
     }
     
+    // Pokemon Snap port: overwrites a render target with the previous frame's
+    // presented image. The console never displayed a camera cut's transit
+    // frame -- the cut frame is the heaviest of the scene, the RCP overran,
+    // and gtl skipped the draw, holding the previous image for a tick -- so
+    // the port shows the same thing by copying the previous frame's image
+    // over everything the transit interval presents. The frame itself still
+    // renders first: the game reads its framebuffer back, so its state stays
+    // exactly what the game computed; only the screen holds. The copy is only
+    // an identity when the sizes agree; otherwise the hold is skipped and the
+    // frame shows as rendered, the port's pre-hold behavior.
+    bool WorkloadQueue::threadHoldCopy(RenderTarget *srcTarget, const RenderTargetKey &srcKey, RenderTarget *dstTarget, const RenderTargetKey &dstKey) {
+        std::scoped_lock<std::mutex> managerLock(ext.sharedResources->workloadMutex);
+        RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
+        RenderTarget *srcPtr = (srcTarget != nullptr) ? srcTarget : &targetManager.get(srcKey);
+        if (dstTarget == nullptr) {
+            if (dstKey.isEmpty()) {
+                return false;
+            }
+            dstTarget = &targetManager.get(dstKey);
+        }
+        RenderTarget &src = *srcPtr;
+        if (src.isEmpty() || (&src == dstTarget)) {
+            return false;
+        }
+
+        const uint32_t grownWidth = std::max(dstTarget->width, src.width);
+        const uint32_t grownHeight = std::max(dstTarget->height, src.height);
+        if ((grownWidth != src.width) || (grownHeight != src.height)) {
+            return false;
+        }
+
+        // With antialiasing on, the two sides of this transfer are not the
+        // same kind of surface. The port owns single-sampled targets (the
+        // hold scratch, the interpolated targets) while the target manager
+        // hands out multisampled ones, and a plain copy is vkCmdCopyImage /
+        // CopyTextureRegion underneath, both of which require the sample
+        // counts to agree. Resizing cannot reconcile them: a target is
+        // rebuilt with its own sample count. Multisampled into
+        // single-sampled is exactly a resolve, so that direction is served.
+        // The reverse has no counterpart -- a resolved image cannot be
+        // un-resolved, and the one surface it could be written to is also
+        // what the framebuffer write-back reads, which this game reads back
+        // -- so it declines, and the caller shows the frame as rendered.
+        const bool srcUsesMSAA = (src.multisampling.sampleCount > 1);
+        if (dstTarget->multisampling.sampleCount > 1) {
+            return false;
+        }
+
+        workerMutex.lock();
+        RenderWorker *worker = ext.workloadGraphicsWorker;
+        worker->commandList->begin();
+        dstTarget->resize(worker, src.width, src.height);
+
+        if (srcUsesMSAA) {
+            dstTarget->resolveFromTarget(worker, &src, ext.shaderLibrary);
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(dstTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+        }
+        else {
+            // Drawn, not transferred: RT64 keeps transfer commands away from
+            // its render targets (render/rt64_render_target.cpp,
+            // snapCopyFromTargetRaster, which says what this was and was not).
+            dstTarget->snapCopyFromTargetRaster(worker, &src, ext.shaderLibrary);
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(dstTarget->texture.get(), RenderTextureLayout::SHADER_READ));
+        }
+        worker->commandList->end();
+        worker->execute();
+        worker->wait();
+        workerMutex.unlock();
+
+        // The present queue reads these from the target it shows.
+        dstTarget->resolutionScale = src.resolutionScale;
+        dstTarget->downsampleMultiplier = src.downsampleMultiplier;
+        dstTarget->misalignX = src.misalignX;
+        dstTarget->invMisalignX = src.invMisalignX;
+        return true;
+    }
+
     void WorkloadQueue::threadRenderFrame(GameFrame &curFrame, const GameFrame &prevFrame, const WorkloadConfiguration &workloadConfig,
         const DebuggerRenderer &debuggerRenderer, const DebuggerCamera &debuggerCamera, float curFrameWeight, float prevFrameWeight,
         float deltaTimeMs, RenderTargetKey overrideTargetKey, int32_t overrideTargetFbPairIndex, RenderTarget *overrideTarget,
-        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts)
+        uint32_t overrideTargetModifier, bool uploadVelocity, bool uploadExtras, bool interpolateTiles, bool interpolateLookAts,
+        bool interpolationSubFrame)
     {
 #   if ENABLE_HIGH_RESOLUTION_RENDERER
+        // A present gap is exactly the length of the slowest sub-frame
+        // render, so a slow one names its phase here: the mutex wait, the
+        // recording, the uploader fence, or the GPU itself.
+        const auto snapT0 = std::chrono::steady_clock::now();
         std::scoped_lock<std::mutex> managerLock(ext.sharedResources->workloadMutex);
+        const auto snapTLock = std::chrono::steady_clock::now();
         FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
         RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
         const bool usingMSAA = (targetManager.multisampling.sampleCount > 1);
@@ -317,6 +434,30 @@ namespace RT64 {
             projectionProcessor.process(projParams);
             projectionProcessor.upload(projParams);
             uploadProjections = true;
+        }
+
+        // Pokemon Snap port: on the frames where most of the scene's transform
+        // identities change at once -- the block-transition and spawn frames --
+        // ask the present queue to photograph what is actually put on screen
+        // around this moment, so a reported artifact lands on disk as images
+        // instead of as a description. store() rather than read-modify-write:
+        // the present thread decrements this as it consumes the window.
+        if (snapdiag::captureEnabled() && prevFrame.matched) {
+            uint32_t transformCount = 0, mappedCount = 0;
+            for (uint32_t w : curFrame.workloads) {
+                transformCount += uint32_t(workloads[w].drawData.worldTransforms.size());
+                const GameFrameMap::WorkloadMap &wm = curFrame.frameMap.workloads[w];
+                if (wm.mapped) {
+                    for (const auto &tm : wm.transforms) {
+                        if (tm.mapped) {
+                            mappedCount++;
+                        }
+                    }
+                }
+            }
+            if ((transformCount >= 10) && (mappedCount * 5 < transformCount * 3)) {
+                snap_frame_dump_pending.store(6);
+            }
         }
 
         const bool processTransforms = prevFrame.matched;
@@ -419,11 +560,56 @@ namespace RT64 {
                 const auto &colorImg = fbPair.colorImage;
                 const auto &depthImg = fbPair.depthImage;
                 fixedResScale = workloadConfig.resolutionScale;
-                if (!fbPair.drawColorRect.isEmpty()) {
+                const FixedRect displayRect = fbPair.displayColorRect(workloadConfig.aspectRatioScale > 1.0f);
+                // Pokemon Snap port, diagnostic (SNAP_WIDE_DIAG): a pass the
+                // native rectangle would have dropped and the display one keeps.
+                {
+                    static const bool snapPassDiag = (getenv("SNAP_WIDE_DIAG") != nullptr);
+                    if (snapPassDiag && fbPair.drawColorRect.isEmpty() && !displayRect.isEmpty()) {
+                        fprintf(stdout, "[SNAP-PASS] pair %u kept: calls %u sc %d..%d x %d..%d\n", f, fbPair.gameCallCount,
+                            fbPair.scissorRect.ulx / 4, fbPair.scissorRect.lrx / 4, displayRect.ulx / 4, displayRect.lrx / 4);
+                    }
+                }
+                if (!displayRect.isEmpty()) {
                     colorFb = nullptr;
                     depthFb = nullptr;
                     nativeColorWidth = colorImg.width;
-                    nativeColorHeight = fbPair.drawColorRect.bottom(true);
+                    nativeColorHeight = displayRect.bottom(true);
+
+                    // The height cannot be allowed to shrink to the geometry, because
+                    // that height ends up clipping the geometry.
+                    //
+                    // drawColorRect is a bounding box fitted to where this pass's
+                    // vertices landed, and it is fitted at display list parse time,
+                    // from the frame's own matrices (rt64_rsp.cpp, posScreen). The
+                    // height taken from it becomes the render target's size, reaches
+                    // the rasterizer as FbParams.resolution.y, and RasterVS builds
+                    // clip space from that -- so the bottom of the fitted box is a
+                    // hard clip plane. The vertices that get tested against it are
+                    // not the ones it was fitted to: they are positioned by the
+                    // interpolated view, one subframe behind. Anything the
+                    // interpolation places below where the geometry sat this frame is
+                    // clipped away.
+                    //
+                    // Only the bottom edge does this. The width is colorImg.width,
+                    // which the game declared, and the viewport starts at y = 0, so
+                    // neither tracks content. That asymmetry is why the artifact this
+                    // fixes had one too: pitching the camera down sweeps the world up
+                    // the screen, so an interpolated subframe sits lower than the
+                    // frame the box was fitted to and crosses the bottom edge, while
+                    // pitching up moves geometry towards a fixed y = 0 it was already
+                    // inside and never clips anything. The band lost is the residual
+                    // screen displacement, a fixed number of pixels, which is most of
+                    // a distant model and only the feet of a near one.
+                    //
+                    // The scissor is the right bound to hold it to. The game authors
+                    // it, the real RDP clips against it, and it does not move when the
+                    // view is interpolated. Fitting to geometry stays fine for what it
+                    // is good for -- deciding how much to allocate and write back --
+                    // but it must not be what decides which pixels exist.
+                    if (!fbPair.scissorRect.isNull()) {
+                        nativeColorHeight = std::max(nativeColorHeight, uint32_t(std::max(0, fbPair.scissorRect.bottom(true))));
+                    }
 
                     // When the target is much bigger than the reference height, we reduce the resolution scaling (but clamped to 1.0).
                     const uint32_t heightThreshold = (workload.viFbSize[1] > 0) ? ((workload.viFbSize[1] * 3) / 2) : 360;
@@ -623,6 +809,41 @@ namespace RT64 {
                     drawParams.fbPairIndex = f;
                     drawParams.fbWidth = nativeColorWidth;
                     drawParams.fbHeight = nativeColorHeight;
+                    // Pokemon Snap port, diagnostic (SNAP_PASS_TRACE): every
+                    // pass of a workload that contains a pass with a colour
+                    // image at most sixteen pixels wide, with the target it
+                    // was given. For the Deck's top-left box (2026-09-12).
+                    {
+                        static const bool passTrace = (std::getenv("SNAP_PASS_TRACE") != nullptr);
+                        static uint32_t tracedWorkloads = 0;
+                        static uint32_t tracedWorkloadId = UINT32_MAX;
+                        static bool traceThis = false;
+                        if (passTrace) {
+                            if (tracedWorkloadId != workload.workloadId) {
+                                tracedWorkloadId = workload.workloadId;
+                                bool tiny = false;
+                                for (uint32_t t = 0; t < fbPairCount; t++) {
+                                    tiny = tiny || (workload.fbPairs[t].colorImage.width <= 16);
+                                }
+                                traceThis = tiny && (tracedWorkloads < 40);
+                                if (traceThis) {
+                                    tracedWorkloads++;
+                                    fprintf(stdout, "[SNAP-PASS] workload %llu: %u pairs, presented pair %d, msaa %d, interpolated %d\n",
+                                        (unsigned long long) workload.workloadId, fbPairCount, overrideTargetFbPairIndex, usingMSAA ? 1 : 0, interpolationSubFrame ? 1 : 0);
+                                }
+                            }
+                            if (traceThis) {
+                                fprintf(stdout, "[SNAP-PASS]   pair %u: color %08X w %u (native %u) draw h %d, target %ux%u rev %llu, depth %s target %ux%u, dummy %d\n",
+                                    f, fbPair.colorImage.address, fbPair.colorImage.width, nativeColorWidth, fbPair.drawColorRect.bottom(true),
+                                    (colorTarget != nullptr) ? colorTarget->width : 0, (colorTarget != nullptr) ? colorTarget->height : 0,
+                                    (unsigned long long)((colorTarget != nullptr) ? colorTarget->textureRevision : 0),
+                                    (fbPair.depthRead || fbPair.depthWrite) ? "yes" : "no",
+                                    (depthTarget != nullptr) ? depthTarget->width : 0, (depthTarget != nullptr) ? depthTarget->height : 0,
+                                    (depthTarget == nullptr) ? 1 : 0);
+                                fflush(stdout);
+                            }
+                        }
+                    }
                     drawParams.targetWidth = targetWidth;
                     drawParams.targetHeight = targetHeight;
                     drawParams.rasterShaderCache = ext.rasterShaderCache;
@@ -639,6 +860,7 @@ namespace RT64 {
                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
+                    drawParams.snapRectWeight = curFrameWeight;
                     framebufferRenderer->addFramebuffer(drawParams);
                 }
                 
@@ -699,6 +921,36 @@ namespace RT64 {
 
             workerMutex.lock();
             ext.workloadGraphicsWorker->commandList->begin();
+
+            // Pokemon Snap port, diagnostic (SNAP_OP_TRACE): the frame's
+            // marker; the trace arms itself at the first workload that has a
+            // pass with a colour image at most sixteen pixels wide.
+            if (snapdiag::opTraceEnabled()) {
+                static bool snapOpTraceArmed = false;
+                bool tiny = false;
+                for (uint32_t t = 0; t < fbPairCount; t++) {
+                    tiny = tiny || (workload.fbPairs[t].colorImage.width <= 16);
+                }
+                if (tiny && !snapOpTraceArmed) {
+                    snapOpTraceArmed = true;
+                    snapdiag::opTraceArm(12000);
+                }
+                snapdiag::opTrace("Workload", "workload %u begin: %u pairs, presented pair %d, msaa %d, subframe %d, tiny %d",
+                    workload.workloadId, fbPairCount, overrideTargetFbPairIndex, usingMSAA ? 1 : 0, interpolationSubFrame ? 1 : 0, tiny ? 1 : 0);
+            }
+
+            // Pokemon Snap port: a target created for this frame is cleared
+            // before anything is read or drawn into it -- first in this
+            // recording, ahead of the framebuffer's RAM read and the passes
+            // (rt64_render_target.cpp, snapFreshMemory).
+            for (auto colorDepthPair : colorDepthPairs) {
+                if ((colorDepthPair.first != nullptr) && colorDepthPair.first->snapFreshMemory) {
+                    colorDepthPair.first->setupColorFramebuffer(ext.workloadGraphicsWorker);
+                }
+                if ((colorDepthPair.second != nullptr) && colorDepthPair.second->snapFreshMemory) {
+                    colorDepthPair.second->setupDepthFramebuffer(ext.workloadGraphicsWorker);
+                }
+            }
             ext.workloadGraphicsWorker->commandList->resetQueryPool(queryPool.get(), 0, 2);
             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
             framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
@@ -743,6 +995,12 @@ namespace RT64 {
 
                             if (colorFbChange != nullptr) {
                                 colorTarget->copyFromChanges(ext.workloadGraphicsWorker, *colorFbChange, colorFb->width, readRowCount, colorFb->readHeight, ext.shaderLibrary);
+                                if (snapdiag::statsEnabled()) {
+                                    fprintf(stdout, "[SNAP-FBRELOAD] color rows %u..%u (fb %08X h %u) at frame %u\n",
+                                        colorFb->readHeight, colorFb->height, colorFb->addressStart, colorFb->height,
+                                        snapdiag::gameFrameCounter().load(std::memory_order_relaxed));
+                                    fflush(stdout);
+                                }
                             }
 
                             colorFb->readHeight = colorFb->height;
@@ -770,12 +1028,29 @@ namespace RT64 {
                             }
                         }
 
-                        if (imgFormatChanged) {
+                        // Pokemon Snap port: the clear and reload below keep the
+                        // depth target coherent with RDRAM, and they belong to the
+                        // raw render only. An interpolated sub-frame is a replay:
+                        // its depth continuity is its own passes, rendered at the
+                        // interpolated pose. On the frames where the game's 8x8
+                        // detector passes interleave with the scene, the shared
+                        // depth address flips width every boundary, readHeight
+                        // resets each time, and this reload would stomp the
+                        // sub-frame's depth with the raw render's final-pose
+                        // snapshot -- geometry then z-tests against a ghost of
+                        // where the world will be, which is the one-frame flash
+                        // at every block transition and spawn corner.
+                        if (imgFormatChanged && !interpolationSubFrame) {
                             depthTarget->clearDepthTarget(ext.workloadGraphicsWorker);
                             depthFb->readHeight = 0;
                         }
 
-                        if (depthFb->height > depthFb->readHeight) {
+                        // The watermark only advances when the reload actually
+                        // ran. A skipped reload that still marked the rows
+                        // consumed would leave the depth target permanently
+                        // unseeded: once readHeight equals height nothing ever
+                        // re-arms it, not even a later non-interpolated frame.
+                        if ((depthFb->height > depthFb->readHeight) && !interpolationSubFrame) {
                             uint32_t readRowCount = depthFb->height - depthFb->readHeight;
                             FramebufferChange *depthFbChange = depthFb->readChangeFromStorage(ext.workloadGraphicsWorker, workload.fbStorage, scratchFbChangePool, Framebuffer::Type::Depth,
                                 G_IM_FMT_DEPTH, f, depthFb->readHeight, readRowCount, ext.shaderLibrary);
@@ -839,10 +1114,26 @@ namespace RT64 {
 
             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 1);
             ext.workloadGraphicsWorker->commandList->end();
+            const auto snapTRecord = std::chrono::steady_clock::now();
             framebufferRenderer->waitForUploaders();
+            const auto snapTUpload = std::chrono::steady_clock::now();
             ext.workloadGraphicsWorker->execute();
             ext.workloadGraphicsWorker->wait();
             workerMutex.unlock();
+
+            if (snapdiag::statsEnabled()) {
+                const auto snapTEnd = std::chrono::steady_clock::now();
+                const double totalMs = std::chrono::duration<double, std::milli>(snapTEnd - snapT0).count();
+                if (totalMs > 8.0) {
+                    fprintf(stdout, "[SNAP-RFRAME] %.1f ms: lock %.1f record %.1f uploadWait %.1f gpu %.1f\n",
+                        totalMs,
+                        std::chrono::duration<double, std::milli>(snapTLock - snapT0).count(),
+                        std::chrono::duration<double, std::milli>(snapTRecord - snapTLock).count(),
+                        std::chrono::duration<double, std::milli>(snapTUpload - snapTRecord).count(),
+                        std::chrono::duration<double, std::milli>(snapTEnd - snapTUpload).count());
+                    fflush(stdout);
+                }
+            }
 
             // Update the GPU profiler with the results from the timestamps of the frame.
             queryPool->queryResults();
@@ -882,12 +1173,23 @@ namespace RT64 {
         Thread::setCurrentThreadName("RT64 Workload");
 
         WorkloadConfiguration workloadConfig;
+        // Counts drawn frames, so the motion position below is monotone across
+        // ticks and two images can simply be subtracted.
+        int64_t snapMotionBase = 0;
         int64_t logicalTicks = 0;
         int64_t displayTicks = 0;
         uint32_t originalRateForTicks = 0;
         uint32_t displayRateForTicks = 0;
         int processCursor = -1;
         bool frameReduction = false;
+        // The previous game frame's presented target, for the cut-transit hold.
+        // The game's cuts are hard cuts and release as hard cuts; a crossfade
+        // tail was tried here and read as a glitch on screen.
+        RenderTargetKey snapPrevTargetKey;
+        uint32_t snapConsecutiveHolds = 0;
+        // How many interpolated targets the last shown frame filled; its final
+        // one is the last picture the screen actually displayed.
+        uint32_t snapPrevInterpolatedIndex = 0;
         while (threadsRunning) {
             {
                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
@@ -939,7 +1241,7 @@ namespace RT64 {
                     for (int32_t f = workload.fbPairCount - 1; f >= 0; f--) {
                         const FramebufferPair &fbPair = workload.fbPairs[f];
                         bool interpolationCandidate = fbPair.earlyPresentCandidate();
-                        if (fbPair.drawColorRect.isEmpty()) {
+                        if (fbPair.displayColorRect(workloadConfig.aspectRatioScale > 1.0f).isEmpty()) {
                             continue;
                         }
 
@@ -986,21 +1288,194 @@ namespace RT64 {
                     matchingProfiler.log();
 
                     const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
-                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty();
+                    // Cutscenes interpolate fully, like gameplay. Both
+                    // partial modes were tried and read wrong: native
+                    // cadence stutters on every pan, and view-only (content
+                    // pinned to the current frame) runs the whole intro at
+                    // half rate. What the film's staged ticks actually need
+                    // is to not be shown at all, and that is handled by
+                    // verdicts, not weights: a tick the game declares an
+                    // authored step is held rather than shown, camera cuts
+                    // snap through their matrix group, and the pose guard
+                    // keeps shown pairs from blending across a re-pose.
+                    // Pokemon Snap port: no interpolation while the game is
+                    // fast-forwarded (rt64_snap_diag.h speedPermille): its
+                    // frames come faster than the display and the latest raw
+                    // one is shown; the tick accounting starts over from the
+                    // rate when the key is released (resetTicks below). Slow
+                    // motion keeps interpolating, over a stretched span.
+                    const uint32_t snapSpeedNow = std::max<uint32_t>(snapdiag::speedPermille().load(std::memory_order_relaxed), 1);
+                    generateInterpolatedFrames = !workload.paused && displayRateAboveOriginal && !interpolationTargetKey.isEmpty() &&
+                        (snapSpeedNow <= 1000);
 
-                    const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal;
+                    // Pokemon Snap port: a speed change restarts the tick
+                    // accounting as a rate change does. The span a frame is
+                    // counted in follows the speed (below), and a gap built
+                    // at one span would be paid off unevenly at the other:
+                    // fifteen seconds of uneven pairs after a slow-motion
+                    // release, measured 2026-09-14.
+                    static uint32_t snapSpeedForTicks = 1000;
+                    const bool resetTicks = !generateInterpolatedFrames || (originalRateForTicks != workload.viOriginalRate) || (displayRateForTicks != workloadConfig.targetRate) || !displayRateAboveOriginal ||
+                                            (snapSpeedForTicks != snapSpeedNow);
                     if (resetTicks) {
                         logicalTicks = 0;
                         displayTicks = 0;
                         originalRateForTicks = workload.viOriginalRate;
                         displayRateForTicks = workloadConfig.targetRate;
+                        snapSpeedForTicks = snapSpeedNow;
                     }
                 }
+
+                // How much of the world's motion this drawn frame stands for.
+                //
+                // The game updates the world more often than it draws it -- every
+                // course here runs its logic twice per drawn frame -- and when it
+                // cannot take the graphics context it skips the draw entirely and
+                // keeps updating. So a drawn frame usually carries two steps of
+                // motion and sometimes three, and the one that carries three is
+                // half again as far from its predecessor in both world motion and
+                // wall-clock time.
+                //
+                // The span below used to be the same constant for every frame. A
+                // three-step frame was therefore spread over a two-step slice of
+                // the display's time: the blend reached the new pose early and the
+                // picture then stood still until the next frame arrived. Motion,
+                // stall, jump -- which is what a spawn or a scene point feels like,
+                // and it is the renderer's doing rather than the game's, because
+                // the game did produce a pose for every one of those steps.
+                //
+                // Nothing here changes what is drawn. Both ends of the blend are
+                // still poses the game computed and the weight still runs zero to
+                // one between them; only how long that takes changes.
+                //
+                // The normal step count is taken as the most common value seen
+                // recently, not the smallest. A loading frame can carry one step,
+                // and treating that as normal would make every ordinary frame look
+                // like a skip and stretch it to double length.
+                static uint32_t snapStepHistogram[8] = {};
+                static uint32_t snapStepSamples = 0;
+                static uint32_t snapNormalSteps = 0;
+                const uint32_t snapSteps = std::min(workload.snapLogicSteps, 7u);
+                if (snapSteps > 0) {
+                    snapStepHistogram[snapSteps]++;
+                    snapStepSamples++;
+                    if (snapStepSamples >= 120) {
+                        uint32_t bestSteps = 0;
+                        uint32_t bestCount = 0;
+                        for (uint32_t s = 1; s < 8; s++) {
+                            if (snapStepHistogram[s] > bestCount) {
+                                bestCount = snapStepHistogram[s];
+                                bestSteps = s;
+                            }
+
+                            snapStepHistogram[s] = 0;
+                        }
+
+                        snapNormalSteps = bestSteps;
+                        snapStepSamples = 0;
+                    }
+                }
+
+                // Spreading a longer frame over more of the display's time was
+                // tried here and measured worse: twenty-two frames over the
+                // threshold against seven with it off, on the same ride and the
+                // same materials. Two reasons, both fatal.
+                //
+                // The normal step count cannot be inferred from recent history.
+                // A stretch of menu frames carries one step each, so the count
+                // learned there is one, and every ordinary two-step gameplay
+                // frame after it then looks like a skipped draw and gets stretched
+                // to double length. The misfire is not rare; it happens at every
+                // transition between modes.
+                //
+                // And even when it fires correctly it is the wrong medicine. A
+                // frame carries an extra logic step precisely because the renderer
+                // was too busy to take the graphics context, and stretching its
+                // span asks that same renderer for half again as many sub-frames.
+                // The response to being late is more work, which makes the next
+                // frame later.
+                //
+                // Measured, the game skips a draw about once a ride -- steady play
+                // reports two logic steps per frame and zero skips -- so this was
+                // a risky remedy for something rare. The counters stay because
+                // they are what established that.
+                //
+                // The second attempt below answers both killers instead of
+                // inferring. Nothing is learned from history: the stretch fires
+                // only for the exact authored signature of a course block
+                // crossing -- three logic steps on a frame whose nominal
+                // cadence is two fields (viOriginalRate 30), outside any
+                // cutscene or cut hold, corroborated by the frame actually
+                // arriving a skipped draw late on the wall clock. Menus run a
+                // different cadence and fail the rate gate; loading frames
+                // fail the step gate; a cut fails the cutscene gate; a
+                // renderer hiccup that delays arrival without a game-side
+                // skipped draw fails the step gate. And the renderer is no
+                // longer the reason for the skip: the crossing frame's delay
+                // is the game's own transition (the renderer waits measured
+                // near zero there), so asking it for one more sub-frame costs
+                // a few milliseconds against thirty of slack -- and the
+                // sub-frame budget below is widened by the same ratio so the
+                // extra sub-frame is not immediately dropped as over budget.
+                // Without the stretch, three fields of motion play back in a
+                // two-field window: the fast-forward lurch after every
+                // crossing hold. With it, on-screen velocity stays constant
+                // and the one-sub-frame backlog it creates is unwound by the
+                // existing frameReduction catch-up.
+                // Pokemon Snap port: in slow motion (speedPermille below
+                // 1000) a game frame stands for that much more of the
+                // display's time, so its span is stretched to match and the
+                // blend runs through it at the slower pace; the crossing
+                // stretch below scales its wall-clock gate the same way and
+                // stretches the stretched span, so a slow ride keeps it.
+                const uint32_t snapSpeedPermille = std::max<uint32_t>(snapdiag::speedPermille().load(std::memory_order_relaxed), 1);
+                const double snapGapScale = 1000.0 / double(snapSpeedPermille);
+                int64_t snapSpanTicks = (snapSpeedPermille >= 1000) ? int64_t(workloadConfig.targetRate)
+                                                                    : (int64_t(workloadConfig.targetRate) * 1000) / int64_t(snapSpeedPermille);
+                {
+                    static std::chrono::steady_clock::time_point snapLastArrival{};
+                    const auto snapArrival = std::chrono::steady_clock::now();
+                    const double snapGapMs = (snapLastArrival.time_since_epoch().count() != 0)
+                        ? std::chrono::duration<double, std::milli>(snapArrival - snapLastArrival).count()
+                        : 0.0;
+                    snapLastArrival = snapArrival;
+                    const bool snapCrossingFrame =
+                        generateInterpolatedFrames &&
+                        (workload.snapLogicSteps == 3) &&
+                        (workload.viOriginalRate == 30) &&
+                        !workload.snapCutscene &&
+                        !workload.snapCutHold &&
+                        (snapGapMs > 40.0 * snapGapScale) && (snapGapMs < 70.0 * snapGapScale);
+                    if (snapCrossingFrame) {
+                        snapSpanTicks = (snapSpanTicks * 3) / 2;
+                        if (snapdiag::statsEnabled()) {
+                            fprintf(stdout, "[SNAP-STRETCH] crossing frame spread over three fields (arrived %.1f ms late of nominal)\n",
+                                snapGapMs - (2000.0 / 60.0));
+                            fflush(stdout);
+                        }
+                    }
+                    else if ((workload.snapLogicSteps == 3) && snapdiag::statsEnabled()) {
+                        fprintf(stdout, "[SNAP-STRETCH] three-step frame NOT stretched: rate %u cutscene %d hold %d gap %.1f ms\n",
+                            workload.viOriginalRate, workload.snapCutscene ? 1 : 0,
+                            workload.snapCutHold ? 1 : 0, snapGapMs);
+                        fflush(stdout);
+                    }
+                }
+
+                if (snapdiag::statsEnabled()) {
+                    snapdiag::logicStepCounter().fetch_add(snapSteps, std::memory_order_relaxed);
+                    snapdiag::drawnFrameCounter().fetch_add(1, std::memory_order_relaxed);
+                    if ((snapNormalSteps > 0) && (snapSteps > snapNormalSteps)) {
+                        snapdiag::skippedDrawCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
+                snapMotionBase++;
 
                 // Estimate amount of frames to render based on how many display frames it'd take to reach the next logical frame.
                 uint32_t displayFrames = 1;
                 if (generateInterpolatedFrames) {
-                    logicalTicks += workloadConfig.targetRate;
+                    logicalTicks += snapSpanTicks;
                     displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
                     deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
 
@@ -1011,13 +1486,88 @@ namespace RT64 {
                     }
 
                     assert((logicalTicks > displayTicks) && "Logical ticks must always remain bigger than the display ticks.");
-                    assert(((logicalTicks - displayTicks) <= (workloadConfig.targetRate + workload.viOriginalRate)) && "The gap between logical ticks and display ticks can't be bigger than the target rate.");
+                    assert(((logicalTicks - displayTicks) <= (snapSpanTicks + workload.viOriginalRate)) && "The gap between logical ticks and display ticks can't be bigger than this frame's span.");
                     assert((displayFrames > 0) && "At least one display frame must be generated.");
                 }
                 else if (workload.viOriginalRate > 0) {
                     deltaTimeMs = 1.0f / float(workload.viOriginalRate);
                 }
 
+
+                // Pokemon Snap port: the clock interpolation is built on. Every
+                // display frame between two game frames is placed by assuming
+                // the game ticks at a fixed rate, so if the ticks themselves
+                // arrive unevenly -- or the rate the renderer believes changes
+                // underneath it -- the frames still arrive on a perfect
+                // schedule while the motion inside them speeds up and slows
+                // down. That is stutter no amount of frame counting or present
+                // pacing can see, so it is measured here at its source.
+                if (snapdiag::statsEnabled()) {
+                    static Timestamp lastTickTimestamp;
+                    static double tickTotalMs = 0.0;
+                    static double tickWorstMs = 0.0;
+                    static double tickBestMs = 1e9;
+                    static uint32_t tickCount = 0;
+                    static uint32_t tickUneven = 0;
+                    static uint32_t tickRateChanges = 0;
+                    static uint32_t lastOriginalRate = 0;
+                    static uint32_t lastDisplayFrames = 0;
+                    static uint32_t displayFramesChanges = 0;
+                    if (workload.viOriginalRate != lastOriginalRate) {
+                        tickRateChanges++;
+                        lastOriginalRate = workload.viOriginalRate;
+                    }
+                    if (displayFrames != lastDisplayFrames) {
+                        displayFramesChanges++;
+                        lastDisplayFrames = displayFrames;
+                    }
+                    const Timestamp tickNow = Timer::current();
+                    if (lastTickTimestamp != Timestamp()) {
+                        const double tickMs = std::chrono::duration<double, std::milli>(tickNow - lastTickTimestamp).count();
+                        tickTotalMs += tickMs;
+                        tickWorstMs = std::max(tickWorstMs, tickMs);
+                        tickBestMs = std::min(tickBestMs, tickMs);
+                        tickCount++;
+                        const double tickAverageMs = tickTotalMs / tickCount;
+                        if (std::abs(tickMs - tickAverageMs) > (tickAverageMs * 0.25)) {
+                            tickUneven++;
+                        }
+                        if (tickCount >= 120) {
+                            fprintf(stdout, "[SNAP-TICK] %u game frames, average %.2f ms (%.1f fps), fastest %.2f, slowest %.2f, uneven %u, believed rate %u (changed %u), frames per tick %u (changed %u)\n",
+                                tickCount, tickAverageMs, 1000.0 / tickAverageMs, tickBestMs, tickWorstMs, tickUneven,
+                                workload.viOriginalRate, tickRateChanges, displayFrames, displayFramesChanges);
+                            fflush(stdout);
+                            tickTotalMs = 0.0; tickWorstMs = 0.0; tickBestMs = 1e9; tickCount = 0;
+                            tickUneven = 0; tickRateChanges = 0; displayFramesChanges = 0;
+                        }
+                    }
+                    lastTickTimestamp = tickNow;
+                }
+
+                // Pokemon Snap port: the moment this game frame's content became
+                // available to draw. The present side subtracts it to say how
+                // old the picture on screen is.
+                if (snapdiag::statsEnabled()) {
+                    snapdiag::newestStateNanos().store(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(Timer::current().time_since_epoch()).count(),
+                        std::memory_order_relaxed);
+                }
+
+                // A tick that yields one image is a whole game frame in which
+                // the picture cannot change, however smoothly it is delivered.
+                if ((displayFrames <= 1) && requiresFrameMatching && !workload.paused) {
+                    if (snapdiag::statsEnabled()) {
+                        snapdiag::singleFrameTickCounter().fetch_add(1, std::memory_order_relaxed);
+                        fprintf(stdout, "[SNAP-ONEFRAME] tick produced a single image: game rate %u, target rate %u, interpolation target %s, frames %u\n",
+                            workload.viOriginalRate, workloadConfig.targetRate,
+                            interpolationTargetKey.isEmpty() ? "missing" : "present", displayFrames);
+                        fflush(stdout);
+                    }
+                }
+
+                if (snapdiag::statsEnabled()) {
+                    snapdiag::subFrameAskedCounter().fetch_add(displayFrames, std::memory_order_relaxed);
+                }
                 ext.sharedResources->viOriginalRate = workload.viOriginalRate;
                 
                 // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
@@ -1041,13 +1591,33 @@ namespace RT64 {
                 curFrameCounters.presented = 0;
                 curFrameCounters.available = 0;
                 curFrameCounters.count = displayFrames;
+                curFrameCounters.snapFirstFromInterpolated = false;
 
                 // Create as many render targets as required to store the interpolated targets.
                 auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
                 const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
                 const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
                 uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
+                // Pokemon Snap port: under antialiasing a cut-transit hold is
+                // delivered through interpolated target 0 whether or not this
+                // tick interpolates (the drawn target is multisampled and
+                // cannot take the copy), so one target has to exist even at
+                // the native rate.
+                if (usingMSAA && !interpolationTargetKey.isEmpty()) {
+                    requiredFrames = std::max(requiredFrames, 1u);
+                }
                 if ((requiredFrames > 0) && (interpolatedTargets.size() < requiredFrames)) {
+                    // Pokemon Snap port: the present thread indexes this same
+                    // vector while showing the frames of the tick before this
+                    // one. Growing it here without the lock can move every
+                    // element while that is happening, which hands the screen
+                    // a pointer into freed memory -- rare, silent, and
+                    // catastrophic when it lands. The number of frames a tick
+                    // needs changes whenever the display or the game's rate
+                    // does, so this is not a startup-only path. The targets
+                    // themselves allocate nothing here; they are sized later,
+                    // so the lock is held only for the bookkeeping.
+                    std::scoped_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
                     uint32_t previousSize = uint32_t(interpolatedTargets.size());
                     interpolatedTargets.resize(requiredFrames);
                     for (uint32_t i = previousSize; i < requiredFrames; i++) {
@@ -1055,7 +1625,211 @@ namespace RT64 {
                     }
                 }
                 
-                const int64_t originalTimeMicro = (workload.viOriginalRate > 0) ? (1000000 / workload.viOriginalRate) : 0;
+                // The console never displayed a cut's transit frame: its draw
+                // overran and gtl held the previous image for a tick. Matched
+                // here by presenting the previous frame's image for this
+                // workload's whole interval, at native rate and interpolated
+                // alike. MSAA resolves through different targets; the hold
+                // stands down there rather than guess.
+                // A frame carrying an authored step is held rather than shown.
+                // Snapping the blend was the wrong remedy and the proof is that
+                // the artifact looks identical with interpolation switched off,
+                // where nothing is blended at all: the fault was never in how
+                // the two poses were mixed, it is that this frame reaches the
+                // screen. On the console it did not. The scheduler skipped a
+                // tick's draw whenever the RCP was still busy (gtl.c), and a
+                // frame where the movie re-poses its cast is the heaviest of
+                // its scene, so the hardware showed the previous picture for
+                // another tick and the new pose arrived already in place. This
+                // reproduces that, from the game's own statement about which
+                // poses are steps.
+                // A skipped draw cannot repeat frame after frame. The console
+                // skipped a tick only while the RCP was still busy with the
+                // previous one, and skipping is what lets it catch up -- so the
+                // frame after a skip is always drawn. A run of re-poses held
+                // one after another is therefore not what the hardware did, and
+                // it is what the last stretch of the intro looked like:
+                // measured at fifteen held frames in sixty-five, a quarter of
+                // that passage standing still. Holding at most every other
+                // frame reproduces the hardware's own limit.
+                // Only an ISOLATED step is a frame the console skipped. Some
+                // of this game's animation is built out of steps and steps
+                // alone -- Mew turning into a ball of light and leaving is
+                // authored that way -- and it changes pose every tick or two
+                // for seconds at a time. The hardware drew all of that: it
+                // could only skip while the RCP was still busy, which a run of
+                // frames never sustains. Holding them instead took out every
+                // other frame of the sequence, which is the stutter.
+                //
+                // A re-pose that follows a stretch of no steps at all is the
+                // other thing entirely -- the movie changing what is on stage,
+                // the heaviest frame of its scene, the one the hardware missed.
+                // That is what gets held.
+                static bool snapPreviousFrameStepHeld = false;
+                static uint32_t snapFramesSinceStep = 0;
+                const bool snapStepDeclared = (workload.snapSteppedIdCount > 0);
+                const bool snapStepIsolated = (snapFramesSinceStep >= 8);
+                const bool snapSteppedFrame = snapStepDeclared && snapStepIsolated && !snapPreviousFrameStepHeld;
+                snapFramesSinceStep = snapStepDeclared ? 0 : (snapFramesSinceStep + 1);
+                // What each verdict asked for, ahead of the guards. A verdict that
+                // fires constantly but is refused and one that never fires look the
+                // same from the hold count alone, and telling them apart cost an
+                // hour once already.
+                if (snapdiag::statsEnabled()) {
+                    if (snapStepDeclared) {
+                        snapdiag::stepDeclaredCounter().fetch_add(1, std::memory_order_relaxed);
+                        if (snapStepIsolated) {
+                            snapdiag::stepIsolatedCounter().fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if (workload.snapCutHold) {
+                        snapdiag::cameraDeclaredCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                // Only while a film is playing.
+                //
+                // A hold repeats the previous picture for a whole game frame to
+                // hide a tick the console never displayed. Measured against a
+                // real session rather than the attract demo, every hold during
+                // play cost a freeze and then a lurch: windows with no holds
+                // advanced the world by an even 0.21 game frames at worst, and
+                // every window containing one jumped 2.14 to 3.21 frames in a
+                // single present. Forty-one holds, forty-one hitches, which is
+                // the stutter that survived every other fix.
+                //
+                // On the console a repeated frame at thirty per second was
+                // nearly invisible. Here the frames around it are interpolated
+                // to the display's rate, so the same repeat is a hole in
+                // otherwise perfectly even motion -- reproducing the skip
+                // faithfully creates a worse artifact than the one it hides.
+                // Where there is no staged tick to hide, which is all of
+                // ordinary play, it buys nothing and costs that.
+                //
+                // Antialiasing used to refuse the hold outside interpolation,
+                // and under interpolation it lost every hold that landed on a
+                // tick of a single display frame: the drawn target is
+                // multisampled, so the held picture went into interpolated
+                // target 0, which the present thread shows only for a tick of
+                // more than one frame. A 90 Hz display over a 60 fps passage
+                // (the logos, the intro's first shots) alternates one- and
+                // two-frame ticks, and a 60 Hz display never interpolates at
+                // all -- the frame after the HAL logo showed on every Deck
+                // and every 60 Hz monitor with antialiasing on while the
+                // counters said it was held. The hold is now delivered
+                // through interpolated target 0 in every antialiased case and
+                // the present thread is told to show it (snapFirstFromInterpolated).
+                bool snapCutHold = (workload.snapCutHold || snapSteppedFrame) &&
+                    workload.snapCutscene &&
+                    !workload.paused &&
+                    !interpolationTargetKey.isEmpty() && !snapPrevTargetKey.isEmpty();
+
+                // Release valve on the renderer-side verdict: a scene that
+                // churns endlessly must not freeze the screen. Sixteen frames
+                // outlasts every observed transition; past it the valve stays
+                // open for as long as the verdict keeps firing, so endless
+                // churn shows continuously rather than freezing in bursts.
+                if (snapCutHold && (snapConsecutiveHolds >= 16)) {
+                    snapCutHold = false;
+                    snapConsecutiveHolds++;
+                }
+                if (snapCutHold) {
+                    // Snapshot the previous image before this frame renders a
+                    // single pass; the transit workload's scene-init clears
+                    // can reach into the previous frame's buffer, and a hold
+                    // copied after rendering presents that half-wiped image
+                    // -- the camera prop vanishing for a frame at the cut
+                    // out of the intro's close-up shot.
+                    {
+                        std::scoped_lock<std::mutex> managerLock(ext.sharedResources->workloadMutex);
+                        RenderTargetManager &targetManager = ext.sharedResources->renderTargetManager;
+                        const RenderTarget &holdSrc = targetManager.get(snapPrevTargetKey);
+                        const bool scratchMismatch = (snapHoldScratch != nullptr) && !snapHoldScratch->isEmpty() &&
+                            ((snapHoldScratch->width != holdSrc.width) || (snapHoldScratch->height != holdSrc.height));
+                        if ((snapHoldScratch == nullptr) || scratchMismatch) {
+                            snapHoldScratch = std::make_unique<RenderTarget>(snapPrevTargetKey.address, Framebuffer::Type::Color, RenderMultisampling(), usesHDR);
+                        }
+                    }
+                    // Hold the last picture the screen actually showed, not
+                    // the first one of the previous game frame. The main
+                    // target carries that frame's opening pose; everything
+                    // after it was drawn into the interpolated targets, so
+                    // holding the main target does not stop the picture -- it
+                    // steps it backwards by most of a game frame, keeps it
+                    // there for a frame, and then jumps forwards by two. Two
+                    // poses of the same motion reach the eye a few
+                    // milliseconds apart, which is seen as two of everything
+                    // rather than as a pause.
+                    RenderTarget *lastShownTarget = ((snapPrevInterpolatedIndex > 0) &&
+                        (size_t(snapPrevInterpolatedIndex) <= interpolatedTargets.size())) ?
+                        interpolatedTargets[snapPrevInterpolatedIndex - 1].get() : nullptr;
+                    if ((lastShownTarget != nullptr) && !lastShownTarget->isEmpty()) {
+                        snapCutHold = threadHoldCopy(lastShownTarget, RenderTargetKey(), snapHoldScratch.get(), RenderTargetKey());
+                    }
+                    else {
+                        snapCutHold = threadHoldCopy(nullptr, snapPrevTargetKey, snapHoldScratch.get(), RenderTargetKey());
+                    }
+                    // A hold that actually shows spends valve budget; a
+                    // failed snapshot copy shows the rendered frame instead
+                    // and must not.
+                    snapConsecutiveHolds = snapCutHold ? (snapConsecutiveHolds + 1) : 0;
+                    snapPreviousFrameStepHeld = snapCutHold && snapSteppedFrame;
+                }
+                else {
+                    // A frame that did not hold is the frame the rule was
+                    // written about: the next step may be held again. Assigning
+                    // this only where a hold happened made it a latch instead
+                    // -- one step hold and every later one was refused for the
+                    // rest of the session, which is the whole mechanism
+                    // firing once and then never again.
+                    snapPreviousFrameStepHeld = false;
+
+                    if (!workload.snapCutHold) {
+                        // Only a frame with no verdict at all closes the valve.
+                        snapConsecutiveHolds = 0;
+                    }
+                }
+                if (snapCutHold && snapdiag::statsEnabled()) {
+                    snapdiag::holdCounter().fetch_add(1, std::memory_order_relaxed);
+                    if (workload.snapCutHold) {
+                        snapdiag::holdFromCameraCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (snapSteppedFrame) {
+                        snapdiag::holdFromStepCounter().fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                // Printed in every log: a hold is rare (a camera cut) and is
+                // the one event that writes an interpolated target outside
+                // the resolves, so a report's log says when it happened.
+                if (snapCutHold) {
+                    fprintf(stdout, "[SNAP-HOLD] g%u cut transit: presenting the previous frame for one tick (%s)\n",
+                        snapdiag::gameFrameCounter().load(std::memory_order_relaxed),
+                        workload.snapCutHold ? (snapSteppedFrame ? "camera cut and authored step" : "camera cut") : "authored step");
+                    fflush(stdout);
+                }
+
+                // The wall window this frame's sub-frames must fit is its own
+                // span, not the nominal one: a stretched crossing frame owns
+                // three fields of display time, and judging its three
+                // sub-frames against a two-field budget would drop the third
+                // on arrival -- the second killer of the reverted attempt.
+                //
+                // targetRate is ZERO at the native rate, which is this port's
+                // shipping default and what the Options page writes when a
+                // player turns interpolation off -- so the ratio must not be
+                // formed at all there. The guard this replaced tested only
+                // viOriginalRate, which stops protecting within a few frames
+                // of boot, and the result was an integer divide by zero in the
+                // default configuration: every fresh install killed the
+                // renderer, while this machine survived on a saved config that
+                // happened to have interpolation on. At the native rate there
+                // is no interpolation and no span to scale by, so the window is
+                // exactly the field it always was.
+                const int64_t snapNominalTicks = int64_t(workloadConfig.targetRate);
+                const int64_t originalTimeMicro =
+                    (workload.viOriginalRate <= 0) ? 0 :
+                    (snapNominalTicks > 0)
+                        ? ((1000000 * snapSpanTicks) / (int64_t(workload.viOriginalRate) * snapNominalTicks))
+                        : (1000000 / int64_t(workload.viOriginalRate));
                 const int64_t setupTimeMicro = workloadTimer.elapsedMicroseconds();
                 const int64_t adjustedTimeWindowMicro = originalTimeMicro - setupTimeMicro;
                 const int64_t maxTimePerFrameMicro = adjustedTimeWindowMicro / displayFrames;
@@ -1064,6 +1838,12 @@ namespace RT64 {
                 uint32_t targetIndex = 0;
                 uint32_t framesRendered = 0;
                 int64_t renderTimeTotalMicro = 0;
+                // Pokemon Snap port: whether this tick's held picture was
+                // delivered into interpolated target 0 while the tick itself
+                // drew into the multisampled target (the native rate under
+                // antialiasing), so the bookkeeping below knows which target
+                // the screen actually showed.
+                bool snapHeldIntoFirstTarget = false;
                 for (uint32_t frame = 0; (frame < displayFrames) && !skipWorkloadNow; frame++) {
                     // Evaluate if this frame should be skipped. Measure the current time and compare it to what frame is estimated should be have been rendered by now.
                     if ((frame > 0) && (originalTimeMicro > 0)) {
@@ -1073,6 +1853,7 @@ namespace RT64 {
                         if ((currentTimeMicro > expectedTimeMicro) || ((currentTimeMicro + measuredFrameMicro) > adjustedTimeWindowMicro)) {
                             displayTicks += workload.viOriginalRate;
                             skippedFrames = true;
+                            snapdiag::subFrameDroppedCounter().fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                     }
@@ -1080,9 +1861,38 @@ namespace RT64 {
                     RenderTarget *overrideTarget = nullptr;
                     uint32_t overrideModifier = 0;
                     if (generateInterpolatedFrames) {
-                        prevFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
+                        prevFrameWeight = std::clamp(float(snapSpanTicks + displayTicks - logicalTicks) / float(snapSpanTicks), 0.0f, 1.0f);
                         displayTicks += workload.viOriginalRate;
-                        curFrameWeight = std::clamp((workloadConfig.targetRate + displayTicks - logicalTicks) / float(workloadConfig.targetRate), 0.0f, 1.0f);
+                        curFrameWeight = std::clamp(float(snapSpanTicks + displayTicks - logicalTicks) / float(snapSpanTicks), 0.0f, 1.0f);
+
+                        // Every interpolated frame of a tick must sit further
+                        // along the motion than the one before it. If a weight
+                        // ever moves backwards, two poses of the same motion
+                        // reach the screen out of order and are seen as two of
+                        // everything.
+                        if (snapdiag::statsEnabled()) {
+                            static float lastPresentedWeight = 0.0f;
+                            if ((frame > 0) && (curFrameWeight < lastPresentedWeight - 1e-4f)) {
+                                snapdiag::weightWentBackwardsCounter().fetch_add(1, std::memory_order_relaxed);
+                            }
+                            lastPresentedWeight = curFrameWeight;
+                        }
+
+
+                        // Pokemon Snap port: no whole-frame cut handling here.
+                        // Cuts are declared per transform through the display
+                        // list -- the camera's matrix group skips its
+                        // components on the frame the game's own camera data
+                        // jumped (src/matrix_tags.cpp), covering scripted cuts
+                        // and block-transition origin moves alike, and
+                        // geometry that appears or disappears simply goes
+                        // unpaired and draws at its current pose. Only what
+                        // actually cut snaps; everything else keeps
+                        // interpolating, so a cut costs a single native-rate
+                        // step of the camera instead of a frame of frozen
+                        // motion. Forcing the whole interval's weights here
+                        // was the old mechanism, and its hold WAS the stutter
+                        // reported at every transition.
 
                         // Override the render target.
                         if (usingMSAA || (frame > 0)) {
@@ -1117,11 +1927,124 @@ namespace RT64 {
                     }
 
                     int64_t renderTimeMicro = workloadTimer.elapsedMicroseconds();
-                    threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
-                        interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed);
+                    const uint32_t materialsBefore = snapdiag::statsEnabled() ?
+                        snapdiag::shaderAskedCounter().load(std::memory_order_relaxed) : 0u;
+
+                    // A held interval's extra images are the previous frame
+                    // repeated; only frame zero renders (the game reads its
+                    // framebuffer back, so the transit frame must exist in
+                    // RDRAM exactly as the game computed it), and its
+                    // presented image is then replaced with the previous
+                    // frame's before the present thread is told about it.
+                    const bool heldSubFrame = snapCutHold && (frame > 0) &&
+                        threadHoldCopy(snapHoldScratch.get(), RenderTargetKey(), overrideTarget, RenderTargetKey());
+                    if (!heldSubFrame) {
+                        const bool interpolationSubFrame = generateInterpolatedFrames && (curFrameWeight < 1.0f);
+                        // How far through this pair of poses the image about to
+                        // be drawn sits, recorded against the slot it is drawn
+                        // into, so the present thread can say what the eye was
+                        // actually shown rather than what was scheduled.
+                        if (snapdiag::statsEnabled() && (overrideModifier < snapdiag::SnapMotionSlots)) {
+                            snapdiag::motionSlots()[overrideModifier].store(
+                                (snapMotionBase * 1000000) + int64_t(curFrameWeight * 1000000.0f),
+                                std::memory_order_relaxed);
+                        }
+
+                        threadRenderFrame(curFrame, prevFrame, workloadConfig, workload.debuggerRenderer, workload.debuggerCamera, curFrameWeight, prevFrameWeight, deltaTimeMs,
+                            interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed,
+                            interpolationSubFrame);
+                    }
+
+                    if (snapCutHold && (frame == 0)) {
+                        // If the first image of a held tick cannot be replaced,
+                        // the tick shows one fresh picture followed by a run of
+                        // stale ones -- a step forward, then backwards, which
+                        // is worse than not holding at all. The copy can fail
+                        // for real reasons (a target that has not been sized
+                        // yet, a size that no longer matches), so its answer is
+                        // read rather than assumed, and a hold that cannot be
+                        // delivered whole is abandoned.
+                        bool delivered = false;
+                        bool heldIntoFirstTarget = false;
+                        if (overrideTarget != nullptr) {
+                            delivered = threadHoldCopy(snapHoldScratch.get(), RenderTargetKey(), overrideTarget, RenderTargetKey());
+                            // Under antialiasing the override of frame zero is
+                            // interpolated target 0, the resolve of the drawn
+                            // target; the present thread shows it for a tick of
+                            // more than one frame and must be told to for a
+                            // tick of one.
+                            heldIntoFirstTarget = delivered && usingMSAA;
+                        }
+                        else if (usingMSAA) {
+                            // The native rate under antialiasing: the drawn
+                            // target is multisampled and cannot take the copy,
+                            // so the held picture goes to interpolated target
+                            // 0 and the present thread is told to show it. The
+                            // previous tick may still be presenting from that
+                            // target; the interpolated path waits for that and
+                            // so does this.
+                            RenderTarget *firstTarget = interpolatedTargets.empty() ? nullptr : interpolatedTargets[0].get();
+                            if (firstTarget != nullptr) {
+                                if (useDifferentCounters && (prevFrameCounters.available > 0)) {
+                                    std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                                    ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+                                        return prevFrameCounters.presented > 0;
+                                    });
+                                }
+                                delivered = threadHoldCopy(snapHoldScratch.get(), RenderTargetKey(), firstTarget, RenderTargetKey());
+                                heldIntoFirstTarget = delivered;
+                            }
+                        }
+                        else {
+                            delivered = threadHoldCopy(snapHoldScratch.get(), RenderTargetKey(), nullptr, interpolationTargetKey);
+                        }
+                        if (heldIntoFirstTarget) {
+                            // Written before the present thread is woken for
+                            // this workload (threadAdvanceWorkloadId below).
+                            // At the native rate nothing else counts the
+                            // target as available, and the next tick's hold
+                            // waits on that count before writing it again.
+                            std::scoped_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                            curFrameCounters.snapFirstFromInterpolated = true;
+                            if (!generateInterpolatedFrames) {
+                                curFrameCounters.available = std::max(curFrameCounters.available, 1u);
+                                snapHeldIntoFirstTarget = true;
+                            }
+                        }
+                        if (!delivered) {
+                            snapCutHold = false;
+                            snapConsecutiveHolds = 0;
+                            if (snapdiag::statsEnabled()) {
+                                fprintf(stdout, "[SNAP-HOLDFAIL] a held frame could not be delivered; showing the frame as rendered\n");
+                                fflush(stdout);
+                            }
+                        }
+                        else {
+                            fprintf(stdout, "[SNAP-HOLD] g%u delivered into %s (texture %p)\n",
+                                snapdiag::gameFrameCounter().load(std::memory_order_relaxed),
+                                heldIntoFirstTarget ? "interpolated target 0" : ((overrideTarget != nullptr) ? "the override target" : "the drawn target"),
+                                heldIntoFirstTarget ? (const void *)(interpolatedTargets.empty() ? nullptr : interpolatedTargets[0]->texture.get()) :
+                                    ((overrideTarget != nullptr) ? (const void *)overrideTarget->texture.get() : nullptr));
+                            fflush(stdout);
+                        }
+                    }
 
                     // Add total time the frame took to render.
-                    renderTimeTotalMicro += workloadTimer.elapsedMicroseconds() - renderTimeMicro;
+                    const int64_t frameRenderMicro = workloadTimer.elapsedMicroseconds() - renderTimeMicro;
+                    renderTimeTotalMicro += frameRenderMicro;
+
+                    // A single rendered frame taking several frames' worth of
+                    // time is where a hitch is actually spent. Reported with
+                    // how many materials this frame was the first to ask for,
+                    // which separates "the scene got heavier" from "the driver
+                    // was busy turning new materials into pipelines".
+                    if (snapdiag::statsEnabled() && (frameRenderMicro > 15000)) {
+                        fprintf(stdout, "[SNAP-SLOWFRAME] rendering one frame took %.1f ms, new materials first seen this frame %u, draws %u\n",
+                            double(frameRenderMicro) / 1000.0,
+                            snapdiag::shaderAskedCounter().load(std::memory_order_relaxed) - materialsBefore,
+                            workload.gameCallCount);
+                        fflush(stdout);
+                    }
 
                     // After one frame is rendered, we indicate the workload has been processed so the present thread can start presenting frames as soon as it can.
                     if (frame == 0) {
@@ -1144,6 +2067,7 @@ namespace RT64 {
                         // Add the amount of display ticks that correspond to the remaining frames.
                         if (skipWorkloadNow) {
                             displayTicks += workload.viOriginalRate * (displayFrames - (frame + 1));
+                            snapdiag::workloadDroppedCounter().fetch_add(displayFrames - (frame + 1), std::memory_order_relaxed);
                         }
 
                         ext.sharedResources->interpolatedCondition.notify_all();
@@ -1163,6 +2087,30 @@ namespace RT64 {
                 }
 
                 threadConfigurationValidate();
+
+                // Remember which target this frame presented; a cut-transit
+                // hold on the next frame shows this image again. A held frame
+                // does not become the hold source itself -- its target shows
+                // the previous image, which is exactly what a second
+                // consecutive transit should keep showing.
+                if (!workload.paused && !interpolationTargetKey.isEmpty()) {
+                    snapPrevTargetKey = interpolationTargetKey;
+                    // How many interpolated targets this frame filled, so a
+                    // hold on the next one can take the last picture shown
+                    // rather than this frame's opening pose. A held frame does
+                    // not become a source itself: its targets carry the image
+                    // it was holding, which is what a second consecutive held
+                    // frame should keep showing.
+                    if (!snapCutHold) {
+                        snapPrevInterpolatedIndex = targetIndex;
+                    }
+                    else if (snapHeldIntoFirstTarget) {
+                        // The native rate under antialiasing: the screen
+                        // showed interpolated target 0, not the drawn target,
+                        // so a hold on the next tick copies from there.
+                        snapPrevInterpolatedIndex = 1;
+                    }
+                }
 
                 if (!workload.paused) {
                     threadAdvanceBarrier();

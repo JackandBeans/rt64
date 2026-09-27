@@ -77,6 +77,15 @@ namespace RT64 {
         FixedRect rect;
         int16_t rectDsdx;
         int16_t rectDtdy;
+        // Pokemon Snap port: which 2D element drew this rectangle, and which
+        // of that element's rectangles it is. Zero means no element claimed
+        // it, and an unclaimed rectangle is never moved.
+        uint32_t snapRectId;
+        uint32_t snapRectOrdinal;
+        FixedRect snapPrevRect;
+        int16_t snapPrevDsdx;
+        int16_t snapPrevDtdy;
+        bool snapRectMapped;
         uint16_t rectLeftOrigin;
         uint16_t rectRightOrigin;
         FixedRect scissorRect;
@@ -148,6 +157,8 @@ namespace RT64 {
         bool tileCopyUsed;
         uint16_t tileCopyWidth;
         uint16_t tileCopyHeight;
+        // Pokemon Snap port: the row of a whole-render copy this tile samples from.
+        uint32_t tileCopyRowOffset;
         bool reinterpretTile;
         uint8_t reinterpretSiz;
         uint8_t reinterpretFmt;

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <map>
 #include <set>
 #include <vector>
@@ -79,6 +81,9 @@ namespace RT64 {
             std::unique_ptr<RenderTexture> texture;
             uint32_t textureWidth = 0;
             uint32_t textureHeight = 0;
+            // Pokemon Snap port: the format the texture was made in, so a copy
+            // that outlived a colour-depth change is remade before it is reused.
+            RenderFormat textureFormat = RenderFormat::UNKNOWN;
             uint32_t address = 0;
             uint32_t left = 0;
             uint32_t top = 0;
@@ -92,6 +97,16 @@ namespace RT64 {
             interop::uint2 ditherOffset = { 0, 0 };
             uint32_t ditherPattern = 0;
             float sampleScale = 1.0f;
+            // Pokemon Snap port (hle/rt64_snap_photo_detail.h): log2 of the
+            // box each copied pixel averages, zero for an ordinary copy; the
+            // copy's size in its own texels; whether it is a whole render kept
+            // for sprites to sample rows of; and whether it is pinned against
+            // reuse while a photo may still be drawn from it.
+            uint32_t sourceShift = 0;
+            uint32_t nativeWidth = 0;
+            uint32_t nativeHeight = 0;
+            bool snapWhole = false;
+            bool snapPinned = false;
             bool readColorFromStorage = false;
             bool readDepthFromStorage = false;
             bool needsDiscard = false;
@@ -108,6 +123,8 @@ namespace RT64 {
             uint8_t fmt = 0;
             bool reinterpret = false;
             bool syncRequired = false;
+            // Pokemon Snap port: the row of a whole-render copy this tile starts at.
+            uint32_t rowOffset = 0;
 
             CheckCopyResult() = default;
 
@@ -122,6 +139,10 @@ namespace RT64 {
             RenderFramebuffer *dstFramebuffer;
             RenderDescriptorSet *descriptorSet;
             interop::TextureCopyCB pushConstants;
+            // The destination extent: the source extent for an ordinary copy,
+            // and the source extent over the box for a halved one.
+            uint32_t dstWidth;
+            uint32_t dstHeight;
         };
 
         struct CommandListCopies {
@@ -161,6 +182,18 @@ namespace RT64 {
 
         std::unordered_map<uint32_t, Framebuffer> framebuffers;
         std::unordered_map<uint64_t, TileCopy> tileCopies;
+        // Pokemon Snap port: a copy's id is never reused for another copy.
+        // The id used to be the largest one present plus one, so clearing the
+        // map (a window or aspect change) restarted the numbering and every
+        // id still held elsewhere -- a TMEM region's, a pinned photo's -- named
+        // whatever copy was made next. There are two managers: the game
+        // thread's (State), which hands out the ids, and the render thread's
+        // (SharedQueueResources), which holds the textures and is the one
+        // destroyAllTileCopies runs on. The count of those wipes is shared
+        // between them, so the photo pins (hle/rt64_snap_photo_detail.h) can
+        // tell a copy made before a wipe from one made after it.
+        uint64_t tileCopyIdCounter = 0;
+        static std::atomic<uint64_t> snapTileCopyWipes;
         std::unordered_map<uint64_t, uint64_t> reinterpretTileCache;
         std::unique_ptr<RenderTexture> dummyTLUTTexture;
         std::vector<std::unique_ptr<ReinterpretDescriptorSet>> descriptorReinterpretSets;

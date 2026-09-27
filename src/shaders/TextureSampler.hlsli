@@ -281,8 +281,10 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
             float mipBias = -0.25f;
             mip = 0.5 * log2(ddMax) + mipBias;
             float maxMip = float(gpuTile.textureDimensions.z - 1);
-            RDPMipLevels[0] = min(floor(mip), maxMip);
-            RDPMipLevels[1] = min(floor(mip) + 1, maxMip);
+            // Clamped at both ends: a magnified tile yields a negative mip,
+            // and converting that to uint is undefined before it is shifted.
+            RDPMipLevels[0] = uint(clamp(floor(mip), 0.0f, maxMip));
+            RDPMipLevels[1] = uint(clamp(floor(mip) + 1.0f, 0.0f, maxMip));
             numRDPSamples = 2;
         }
         else {

@@ -4,6 +4,8 @@
 
 #include "rt64_framebuffer_manager.h"
 
+#include "rt64_snap_diag.h"
+
 #include <cassert>
 #include <algorithm>
 
@@ -16,6 +18,8 @@
 #include "render/rt64_render_worker.h"
 
 namespace RT64 {
+    std::atomic<uint64_t> FramebufferManager::snapTileCopyWipes{ 0 };
+
     static void fixSizeToMultiple(uint32_t &width, uint32_t &height) {
         const uint32_t SizeMultiple = 32;
         width = ((width + SizeMultiple - 1) / SizeMultiple) * SizeMultiple;
@@ -111,8 +115,8 @@ namespace RT64 {
         }
 
         const FramebufferTile &fbTile = op.createTileCopy.fbTile;
-        const uint32_t tileWidth = std::clamp<long>(lround((fbTile.right - fbTile.left) * resolutionScale.x), 1L, RenderTarget::MaxDimension);
-        const uint32_t tileHeight = std::clamp<long>(lround((fbTile.bottom - fbTile.top) * resolutionScale.y), 1L, RenderTarget::MaxDimension);
+        const uint32_t tileWidth = std::clamp<long>(lround(((fbTile.right - fbTile.left) >> fbTile.downsampleShift) * resolutionScale.x), 1L, RenderTarget::MaxDimension);
+        const uint32_t tileHeight = std::clamp<long>(lround(((fbTile.bottom - fbTile.top) >> fbTile.downsampleShift) * resolutionScale.y), 1L, RenderTarget::MaxDimension);
         tileCopy.id = op.createTileCopy.id;
         tileCopy.address = op.createTileCopy.address;
         tileCopy.usedWidth = tileWidth;
@@ -128,8 +132,18 @@ namespace RT64 {
         tileCopy.readColorFromStorage = false;
         tileCopy.readDepthFromStorage = false;
         tileCopy.ignore = false;
+        tileCopy.sourceShift = fbTile.downsampleShift;
+        tileCopy.nativeWidth = (fbTile.right - fbTile.left) >> fbTile.downsampleShift;
+        tileCopy.nativeHeight = (fbTile.bottom - fbTile.top) >> fbTile.downsampleShift;
+        tileCopy.snapWhole = (fbTile.wholeImage != 0);
 
-        const bool insufficientSize = (tileCopy.textureWidth < tileWidth) || (tileCopy.textureHeight < tileHeight);
+        // Pokemon Snap port: the format is checked as well as the size. A
+        // whole-render copy survives destroyAllTileCopies, so its texture can
+        // be from before a colour-depth change; once its id is handed out
+        // again the copy pass would render into a texture of the wrong
+        // format. Remade here instead.
+        const RenderFormat textureFormat = RenderTarget::colorBufferFormat(targetManager.usesHDR);
+        const bool insufficientSize = (tileCopy.textureWidth < tileWidth) || (tileCopy.textureHeight < tileHeight) || (tileCopy.textureFormat != textureFormat);
         if (insufficientSize) {
             tileCopy.framebuffer.reset();
             tileCopy.texture.reset();
@@ -138,12 +152,13 @@ namespace RT64 {
         if (tileCopy.texture == nullptr) {
             tileCopy.textureWidth = tileWidth;
             tileCopy.textureHeight = tileHeight;
+            tileCopy.textureFormat = textureFormat;
             fixSizeToMultiple(tileCopy.textureWidth, tileCopy.textureHeight);
 
             RenderTextureFlags textureFlags = RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS;
             textureFlags |= RenderTextureFlag::RENDER_TARGET;
 
-            const RenderTextureDesc textureDesc = RenderTextureDesc::Texture2D(tileCopy.textureWidth, tileCopy.textureHeight, 1, RenderTarget::colorBufferFormat(targetManager.usesHDR), textureFlags);
+            const RenderTextureDesc textureDesc = RenderTextureDesc::Texture2D(tileCopy.textureWidth, tileCopy.textureHeight, 1, textureFormat, textureFlags);
             tileCopy.texture = renderWorker->device->createTexture(textureDesc);
             tileCopy.needsDiscard = true;
         }
@@ -153,11 +168,29 @@ namespace RT64 {
             tileCopy.framebuffer = renderWorker->device->createFramebuffer(RenderFramebufferDesc(&framebufferTexture, 1));
         }
 
-        RenderTargetKey colorTargetKey(fbIt->second.addressStart, fbIt->second.width, fbIt->second.siz, Framebuffer::Type::Color);
+        // Pokemon Snap port: a halved-photo tile names the width its render
+        // used. The entry at this address may since have been re-registered
+        // for another image at another width (the game's scoring passes share
+        // the photo buffer), and that image's target is not the one to copy
+        // from. When the widths differ, RDRAM holds the other image too, so
+        // the photo's target is either still there or cannot be rebuilt: an
+        // empty one is left empty and the copy is skipped.
+        const bool snapDerivedSource = (fbTile.downsampleShift != 0) && (fbTile.sourceWidth != 0) && (fbTile.sourceWidth != fbIt->second.width);
+        RenderTargetKey colorTargetKey(fbIt->second.addressStart, snapDerivedSource ? fbTile.sourceWidth : fbIt->second.width, fbIt->second.siz, Framebuffer::Type::Color);
         RenderTarget &colorTarget = targetManager.get(colorTargetKey);
         uint32_t rtWidth, rtHeight, rtMisalignX;
         RenderTarget::computeScaledSize(fbIt->second.width, fbIt->second.height, resolutionScale, rtWidth, rtHeight, rtMisalignX);
-        if (colorTarget.resize(renderWorker, rtWidth, rtHeight)) {
+        if (snapDerivedSource) {
+            if (colorTarget.isEmpty()) {
+                // Without a texture the draw binds the blank texture instead
+                // (render/rt64_framebuffer_renderer.cpp, createGPUTiles).
+                tileCopy.framebuffer.reset();
+                tileCopy.texture.reset();
+                tileCopy.ignore = true;
+                return;
+            }
+        }
+        else if (colorTarget.resize(renderWorker, rtWidth, rtHeight)) {
             assert(resizedTargets != nullptr);
             colorTarget.resolutionScale = resolutionScale;
             resizedTargets->emplace(&colorTarget);
@@ -188,7 +221,9 @@ namespace RT64 {
 
         auto fbIt = framebuffers.find(op.createTileCopy.address);
         assert(fbIt != framebuffers.end());
-        RenderTargetKey colorTargetKey(fbIt->second.addressStart, fbIt->second.width, fbIt->second.siz, Framebuffer::Type::Color);
+        const FramebufferTile &fbTile = op.createTileCopy.fbTile;
+        const bool snapDerivedSource = (fbTile.downsampleShift != 0) && (fbTile.sourceWidth != 0) && (fbTile.sourceWidth != fbIt->second.width);
+        RenderTargetKey colorTargetKey(fbIt->second.addressStart, snapDerivedSource ? fbTile.sourceWidth : fbIt->second.width, fbIt->second.siz, Framebuffer::Type::Color);
         RenderTarget &colorTarget = targetManager.get(colorTargetKey);
         if (tileCopy.readColorFromStorage) {
             colorTarget.clearColorTarget(renderWorker);
@@ -198,8 +233,10 @@ namespace RT64 {
             }
         }
 
-        // Copy from depth target if the last write was a depth buffer.
-        if (fbIt->second.lastWriteType == Framebuffer::Type::Depth) {
+        // Copy from depth target if the last write was a depth buffer. A
+        // halved-photo copy taken from a target the entry no longer describes
+        // has no business with the entry's last write.
+        if (!snapDerivedSource && (fbIt->second.lastWriteType == Framebuffer::Type::Depth)) {
             RenderTargetKey depthTargetKey(fbIt->second.addressStart, fbIt->second.width, fbIt->second.siz, Framebuffer::Type::Depth);
             RenderTarget &depthTarget = targetManager.get(depthTargetKey);
             if (tileCopy.readDepthFromStorage) {
@@ -220,9 +257,15 @@ namespace RT64 {
 
         cmdListCopies.copyRegionTargets.insert(&colorTarget);
 
-        const uint32_t srcRight = std::min(tileCopy.left + tileCopy.usedWidth, static_cast<uint32_t>(colorTarget.width));
-        const uint32_t srcBottom = std::min(tileCopy.top + tileCopy.usedHeight, static_cast<uint32_t>(colorTarget.height));
+        // Pokemon Snap port: a halved copy reads a box of source pixels per
+        // destination pixel, so its source extent is the box times the copy.
+        const uint32_t sourceShift = tileCopy.sourceShift;
+        const uint32_t srcRight = std::min(tileCopy.left + (tileCopy.usedWidth << sourceShift), static_cast<uint32_t>(colorTarget.width));
+        const uint32_t srcBottom = std::min(tileCopy.top + (tileCopy.usedHeight << sourceShift), static_cast<uint32_t>(colorTarget.height));
         CommandListCopyRegion copyRegion = {};
+        copyRegion.dstWidth = (srcRight - tileCopy.left) >> sourceShift;
+        copyRegion.dstHeight = (srcBottom - tileCopy.top) >> sourceShift;
+        copyRegion.pushConstants.boxSize = { 1u << sourceShift, 1u << sourceShift };
         copyRegion.srcTexture = colorTarget.getResolvedTexture();
         copyRegion.dstTexture = tileCopy.texture.get();
 
@@ -241,6 +284,13 @@ namespace RT64 {
         copyRegion.descriptorSet = colorTarget.textureCopyDescSet->get();
         copyRegion.pushConstants.uvScroll = { float(tileCopy.left), float(tileCopy.top) };
         copyRegion.pushConstants.uvScale = { float(srcRight - tileCopy.left), float(srcBottom - tileCopy.top) };
+        if (snapdiag::opTraceEnabled()) {
+            snapdiag::opTrace(renderWorker->name.c_str(), "tileCopy %llu: fb %08X from target %08X %ux%u rev %llu tex %p at (%u,%u) %ux%u -> dst %ux%u of texture %ux%u tex %p, fromStorage %d",
+                (unsigned long long)tileCopy.id, op.createTileCopy.address, colorTarget.addressForName, colorTarget.width, colorTarget.height,
+                (unsigned long long)colorTarget.textureRevision, (const void *)colorTarget.texture.get(), tileCopy.left, tileCopy.top,
+                srcRight - tileCopy.left, srcBottom - tileCopy.top, copyRegion.dstWidth, copyRegion.dstHeight, tileCopy.textureWidth, tileCopy.textureHeight,
+                (const void *)tileCopy.texture.get(), tileCopy.readColorFromStorage ? 1 : 0);
+        }
         cmdListCopies.cmdListCopyRegions.push_back(copyRegion);
     }
 
@@ -481,6 +531,10 @@ namespace RT64 {
         outTile.siz = fb->siz;
         outTile.fmt = fb->lastWriteFmt;
         outTile.ditherPattern = fb->bestDitherPattern();
+        outTile.sourceWidth = 0;
+        outTile.downsampleShift = 0;
+        outTile.rowOffset = 0;
+        outTile.wholeImage = 0;
 
         return true;
     }
@@ -645,7 +699,7 @@ namespace RT64 {
             if (it->fbTile.valid() && (tmemStart >= it->tmemStart) && (tmemEnd <= it->tmemEnd)) {
                 bool validCopy = false;
                 bool reinterpret = false;
-                uint32_t tileWidth = (it->fbTile.right - it->fbTile.left);
+                uint32_t tileWidth = (it->fbTile.right - it->fbTile.left) >> it->fbTile.downsampleShift;
                 uint32_t tileLineWidth = it->fbTile.lineWidth;
 
                 // Tile reinterpreation is not required when using RGBA16 and Depth tile copies. Allow
@@ -723,7 +777,8 @@ namespace RT64 {
                     result.tileId = it->tileCopyId;
                     result.tileWidth = tileWidth;
                     result.lineWidth = tileLineWidth;
-                    result.tileHeight = it->fbTile.bottom - it->fbTile.top;
+                    result.tileHeight = (it->fbTile.bottom - it->fbTile.top) >> it->fbTile.downsampleShift;
+                    result.rowOffset = it->fbTile.rowOffset;
                     result.fmt = it->fbTile.fmt;
                     result.siz = it->fbTile.siz;
                     result.reinterpret = reinterpret;
@@ -782,16 +837,18 @@ namespace RT64 {
         assert(width > 0);
         assert(height > 0);
 
-        uint64_t newId = 0;
         uint32_t textureWidth = width;
         uint32_t textureHeight = height;
         fixSizeToMultiple(textureWidth, textureHeight);
 
         for (auto &it : tileCopies) {
-            newId = std::max(it.first, newId);
-
             TileCopy &tileCopy = it.second;
             if (tileCopy.usedTimestamp == usedTimestamp) {
+                continue;
+            }
+
+            // Pokemon Snap port: a pinned copy still has a photo to show.
+            if (tileCopy.snapPinned) {
                 continue;
             }
 
@@ -804,8 +861,9 @@ namespace RT64 {
             }
         }
 
-        // Make a new tile with a new Id.
-        TileCopy &tileCopy = tileCopies[++newId];
+        // Make a new tile with a new Id, one no earlier copy ever had.
+        const uint64_t newId = ++tileCopyIdCounter;
+        TileCopy &tileCopy = tileCopies[newId];
         tileCopy.id = newId;
         tileCopy.usedWidth = width;
         tileCopy.usedHeight = height;
@@ -1023,8 +1081,8 @@ namespace RT64 {
             RenderDescriptorSet *lastDescriptorSet = nullptr;
             for (const CommandListCopyRegion &copy : cmdListCopies.cmdListCopyRegions) {
                 renderWorker->commandList->setFramebuffer(copy.dstFramebuffer);
-                renderWorker->commandList->setViewports(RenderViewport(0.0f, 0.0f, copy.pushConstants.uvScale.x, copy.pushConstants.uvScale.y));
-                renderWorker->commandList->setScissors(RenderRect(0, 0, std::lround(copy.pushConstants.uvScale.x), std::lround(copy.pushConstants.uvScale.y)));
+                renderWorker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(copy.dstWidth), float(copy.dstHeight)));
+                renderWorker->commandList->setScissors(RenderRect(0, 0, int32_t(copy.dstWidth), int32_t(copy.dstHeight)));
                 if (copy.descriptorSet != lastDescriptorSet) {
                     renderWorker->commandList->setGraphicsDescriptorSet(copy.descriptorSet, 0);
                     lastDescriptorSet = copy.descriptorSet;
@@ -1084,7 +1142,25 @@ namespace RT64 {
     }
 
     void FramebufferManager::destroyAllTileCopies() {
-        tileCopies.clear();
+        // Pokemon Snap port: a whole-render copy is a photo the game's sprites
+        // are still drawn from (hle/rt64_snap_photo_detail.h), and it stands
+        // on its own -- its own texture, its own framebuffer, no render target
+        // behind it -- so it outlives the targets, and the thumbnails keep
+        // their detail across a window or aspect change. Before this the map
+        // was cleared whole and every sprite still pointing at a pinned copy
+        // drew from a GPU tile that named a copy no longer there (issue #12:
+        // wrong thumbnails after a switch to fullscreen). An ordinary copy is
+        // remade every frame it is needed and goes with the targets.
+        for (auto it = tileCopies.begin(); it != tileCopies.end();) {
+            if (it->second.snapWhole) {
+                it++;
+            }
+            else {
+                it = tileCopies.erase(it);
+            }
+        }
+
+        snapTileCopyWipes.fetch_add(1, std::memory_order_release);
     }
 
     uint64_t FramebufferManager::nextWriteTimestamp() {

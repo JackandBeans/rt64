@@ -19,8 +19,21 @@ namespace RT64 {
     void RigidBody::updateLinear(const hlslpp::float4x4 &prevTransform, const hlslpp::float4x4 &curTransform, uint8_t componentInterpolation) {
         if (componentInterpolation == G_EX_COMPONENT_AUTO) {
             const float Epsilon = 1e-6f;
-            const float VelocityTolerance = 5.0f; // TODO: Make configurable.
+            // Pokemon Snap port: both numbers are in the game's world units,
+            // and this world is large -- the cart glides at three units a
+            // tick, a ride's fastest legitimate motion measured 10.4, a
+            // scripted flyby 85, while the smallest genuine teleport measured
+            // 29.5. At the stock tolerance of five, ordinary authored motion
+            // reads as a teleport several times a second.
+            const float VelocityTolerance = 12.0f;
             const float MagnitudeThreshold = 10.0f; // TODO: Make configurable.
+            // The ratio test asks whether this step is wildly faster than the
+            // last one, which is meaningless when the last one was a standstill:
+            // divided by an epsilon, anything over zero is wildly faster, so
+            // every object that started moving at all was called a teleport.
+            // A floor of one unit makes the question the intended one -- did
+            // this object jump, or did it simply start moving.
+            const float PreviousVelocityFloor = 1.0f;
             hlslpp::float3 prevPosition = prevTransform[3].xyz;
             hlslpp::float3 curPosition = curTransform[3].xyz;
             hlslpp::float3 curLinearVelocity = curPosition - prevPosition;
@@ -29,12 +42,56 @@ namespace RT64 {
             float curVelMag = hlslpp::length(curLinearVelocity);
             float dotCurVel = std::max(hlslpp::dot(linearVelocity / std::max(prevVelMag, Epsilon), curLinearVelocity / std::max(curVelMag, Epsilon))[0], Epsilon);
             curVelMag /= dotCurVel;
-            lerpTranslation = (curVelMag < VelocityTolerance) || (curVelMag / std::max(prevVelMag, Epsilon)) < MagnitudeThreshold;
+            lerpTranslation = (curVelMag < VelocityTolerance) || (curVelMag / std::max(prevVelMag, PreviousVelocityFloor)) < MagnitudeThreshold;
+
+            // Pokemon Snap port: hysteresis. A fast authored move -- Todd
+            // lifting the camera at the end of the close-up -- steps 2 to 7
+            // units a tick, crossing these thresholds back and forth, and a
+            // mix of snapped and blended ticks wobbles visibly. Once a step
+            // is judged discontinuous, keep the pair snapped until its
+            // motion either stops or becomes continuous (velocity close to
+            // the previous tick's), so the whole move steps uniformly.
+            const float velDelta = float(hlslpp::length(curLinearVelocity - linearVelocity));
+            if (!lerpTranslation) {
+                snapDiscontinuityLatch = true;
+                snapLatchAcceptStreak = 0;
+            }
+            else if (snapDiscontinuityLatch) {
+                const bool cameStill = (curVelMag < 1.0f);
+                const bool continuous = velDelta < std::max(1.0f, curVelMag * 0.3f);
+                // Three straight guard-accepts also release: a slow mover
+                // whose velocity is noisy enough to fail the continuity test
+                // every tick would otherwise stay snapped forever off one
+                // rejection. A genuine fast move keeps re-tripping the guard
+                // itself, which resets the streak, so it stays uniform.
+                if (cameStill || continuous || (snapLatchAcceptStreak >= 3)) {
+                    snapDiscontinuityLatch = false;
+                    snapLatchAcceptStreak = 0;
+                }
+                else {
+                    snapLatchAcceptStreak++;
+                    lerpTranslation = false;
+                }
+            }
+
             linearVelocity = curLinearVelocity;
+            // Pokemon Snap port: this rejection means the pair is not two
+            // poses of one motion -- a teleport, a mispair, or a latched
+            // fast move. Blending any component of such a pair lerps between
+            // unrelated matrices; rotation rows blended that way collapse
+            // the geometry into the screen-covering smear the intro flashed
+            // for one frame. updateAngular and updatePerspective read this
+            // and decline too.
+            autoRejectedTranslation = !lerpTranslation;
         }
         else {
             lerpTranslation = (componentInterpolation == G_EX_COMPONENT_INTERPOLATE);
             linearVelocity = 0.0f;
+            autoRejectedTranslation = false;
+            // Explicit modes overrule the guard entirely; its memory must
+            // not survive into a later automatic frame of the same pair.
+            snapDiscontinuityLatch = false;
+            snapLatchAcceptStreak = 0;
         }
     }
 
@@ -68,19 +125,39 @@ namespace RT64 {
             lerpRotation = (rotInterpolation == G_EX_COMPONENT_INTERPOLATE);
             angularVelocity = 0.0f;
         }
+
+        // Pokemon Snap port: a pair whose translation was judged
+        // discontinuous is not one object in motion; see updateLinear.
+        if (autoRejectedTranslation) {
+            lerpRotation = false;
+            lerpScale = false;
+            lerpSkew = false;
+        }
     }
 
     void RigidBody::updatePerspective(const hlslpp::float4x4 &prevTransform, const hlslpp::float4x4 &curTransform, uint8_t perspInterpolation) {
         // TODO auto perspective interpolation.
-        lerpPerspective = (perspInterpolation == G_EX_COMPONENT_INTERPOLATE);
+        lerpPerspective = (perspInterpolation == G_EX_COMPONENT_INTERPOLATE) && !autoRejectedTranslation;
     }
 
-    void RigidBody::updateDecomposition(const hlslpp::float4x4 &curTransform, bool decompose) {
+    void RigidBody::updateDecomposition(const hlslpp::float4x4 &prevTransform, const hlslpp::float4x4 &curTransform, bool decompose) {
+        // Pokemon Snap port: both halves of the pair the caller actually
+        // matched. Only the current transform used to be decomposed, and the
+        // blend took its previous half from whatever this body decomposed a
+        // frame ago -- so the previous matrix handed in here was ignored
+        // entirely whenever decomposition was on. Any caller that supplies a
+        // previous transform other than last frame's own was silently
+        // overruled: crossing into the next world block re-expresses the
+        // previous pose in the new origin precisely so the two can be blended,
+        // and that correction reached this body and was dropped, leaving every
+        // corner of a ride blending from a pose a block away.
         uint8_t newTransformIndex = transformIndex ^ 1;
         if (decompose) {
             transforms[newTransformIndex] = DecomposedTransform(curTransform);
+            transforms[transformIndex] = DecomposedTransform(prevTransform);
         } else {
             transforms[newTransformIndex] = DecomposedTransform();
+            transforms[transformIndex] = DecomposedTransform();
         }
         transformIndex = newTransformIndex;
         lerpDecompose = decompose;

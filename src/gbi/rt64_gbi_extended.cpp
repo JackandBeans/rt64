@@ -147,7 +147,52 @@ namespace RT64 {
             const uint8_t editable = (*dl)->p0(19, 1);
             const uint8_t aspect = (*dl)->p0(20, 2);
             const uint8_t lookat = (*dl)->p0(24, 2);
-            state->rsp->matrixId(id, push, proj, mode, pos, rot, scale, skew, persp, vpos, vtc, tile, lookat, order, aspect, editable, idIsAddress, editGroup);
+
+            // Word3 was reserved as zero. The Pokemon Snap port uses it two
+            // ways, told apart by which stack the group is for. On the
+            // projection side (the camera's group, src/matrix_tags.cpp) bit 0
+            // is the cut-transit hold verdict, arriving in-band with the frame
+            // it belongs to. On the model side (patches/src/render_patch.c) the
+            // whole word names the game object the matrix belongs to, so the
+            // renderer can keep one object's matrices deciding together.
+            const uint32_t word3 = (*dl)->w1;
+            uint32_t coherenceId = 0;
+            if (proj) {
+                if (word3 & 0x1) {
+                    state->snapCutHoldCommand();
+                }
+            }
+            else {
+                coherenceId = word3;
+            }
+
+            state->rsp->matrixId(id, push, proj, mode, pos, rot, scale, skew, persp, vpos, vtc, tile, lookat, order, aspect, editable, idIsAddress, editGroup, coherenceId);
+        }
+
+        // Pokemon Snap port: names an object whose animation stepped to a new
+        // pose this frame instead of moving to it, so the renderer snaps it
+        // rather than drawing the positions between.
+        void authoredStepV1(State *state, DisplayList **dl) {
+            state->snapAuthoredStepCommand((*dl)->w1);
+        }
+
+        // Pokemon Snap port: names the element the rectangles after this one
+        // belong to. The game knows which object is drawing; the renderer,
+        // looking only at a screen-space rectangle, cannot -- a rectangle
+        // carries no transform and no vertices, so nothing about the pixels
+        // distinguishes one strip of a background from the strip above it.
+        // Guessing was tried and produced exactly that failure. The id is the
+        // object's own address, which is stable while it exists and different
+        // from every other object's.
+        void rectGroupV1(State *state, DisplayList **dl) {
+            state->snapRectGroupCommand((*dl)->w1, false);
+        }
+
+        // One rectangle only: the group closes itself after the first, so a
+        // rectangle whose own tag was declined stays unnamed instead of
+        // inheriting a neighbour's name.
+        void rectGroupOneV1(State *state, DisplayList **dl) {
+            state->snapRectGroupCommand((*dl)->w1, true);
         }
 
         void matrixGroupV1(State *state, DisplayList **dl) {
@@ -399,6 +444,9 @@ namespace RT64 {
             Map[G_EX_SETREFRESHRATE_V1] = &setRefreshRateV1;
             Map[G_EX_VERTEXZTEST_V1] = &vertexZTestV1;
             Map[G_EX_ENDVERTEXZTEST_V1] = &endVertexZTestV1;
+            Map[G_EX_AUTHOREDSTEP_V1] = &authoredStepV1;
+            Map[G_EX_RECTGROUP_V1] = &rectGroupV1;
+            Map[G_EX_RECTGROUP_ONE_V1] = &rectGroupOneV1;
             Map[G_EX_MATRIXGROUP_V1] = &matrixGroupV1;
             Map[G_EX_POPMATRIXGROUP_V1] = &popMatrixGroupV1;
             Map[G_EX_FORCEUPSCALE2D_V1] = &forceUpscale2DV1;

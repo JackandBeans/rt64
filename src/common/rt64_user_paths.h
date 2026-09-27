@@ -14,6 +14,9 @@ namespace RT64 {
         std::filesystem::path configurationPath;
         std::filesystem::path imguiPath;
         std::filesystem::path logPath;
+        std::filesystem::path shaderCachePath;
+        std::filesystem::path pipelineCachePath;
+        std::filesystem::path pipelineCacheMarkerPath;
 
         std::filesystem::path detectDataPath(const std::filesystem::path &appId);
         void setupPaths(const std::filesystem::path &dataPath);

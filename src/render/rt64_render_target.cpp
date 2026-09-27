@@ -12,10 +12,23 @@
 #include "shared/rt64_texture_copy.h"
 
 #include "rt64_raster_shader.h"
+#include "hle/rt64_snap_diag.h"
 
 #define PRINT_CONSTRUCTOR_DESTRUCTOR 0
 
 namespace RT64 {
+    // Pokemon Snap port, diagnostic (SNAP_OP_TRACE): one line per recorded
+    // operation on a render target (hle/rt64_snap_diag.h, opTrace).
+    static void snapOpTrace(RenderWorker *worker, const RenderTarget *target, const char *what, const char *detail) {
+        if (!snapdiag::opTraceEnabled()) {
+            return;
+        }
+
+        snapdiag::opTrace(worker->name.c_str(), "%s: target %08X %s %ux%u rev %llu tex %p: %s", what, target->addressForName,
+            (target->type == Framebuffer::Type::Depth) ? "depth" : "color", target->width, target->height,
+            (unsigned long long)target->textureRevision, (const void *)target->texture.get(), detail);
+    }
+
     // RenderTarget
     
     const long RenderTarget::MaxDimension = 0x4000L;
@@ -90,6 +103,8 @@ namespace RT64 {
         textureView = texture->createTextureView(RenderTextureViewDesc::Texture2D(format));
         texture->setName("Render Target Color #" + std::to_string(addressForName));
         textureRevision++;
+        snapFreshMemory = true;
+        snapOpTrace(worker, this, "setupColor", "created");
 
         if (multisampling.sampleCount > 1) {
             resolvedTexture = worker->device->createTexture(RenderTextureDesc::ColorTarget(width, height, format, RenderMultisampling(), &clearValue));
@@ -114,6 +129,8 @@ namespace RT64 {
         textureView = texture->createTextureView(RenderTextureViewDesc::Texture2D(format));
         texture->setName("Render Target Depth #" + std::to_string(addressForName));
         textureRevision++;
+        snapFreshMemory = true;
+        snapOpTrace(worker, this, "setupDepth", "created");
     }
 
     void RenderTarget::setupDummy(RenderWorker *worker) {
@@ -131,6 +148,28 @@ namespace RT64 {
         if (textureFramebuffer == nullptr) {
             const RenderTexture *colorTexture = texture.get();
             textureFramebuffer = worker->device->createFramebuffer(RenderFramebufferDesc(&colorTexture, 1));
+        }
+
+        // Pokemon Snap port: a new texture's memory is whatever the driver
+        // handed back. Direct3D 12 on Windows gives zeroed pages; Vulkan on a
+        // Steam Deck (RADV) gives a previous owner's contents. The game's
+        // framebuffer is read into the target from RAM, but only over the
+        // framebuffer's own area: the margins the widescreen expansion adds
+        // are written by nothing until the picture reaches them, and a scene
+        // that scissors itself narrower than the frame -- a course's opening
+        // cinematic, its dead border included -- left them showing that
+        // stale memory, half black and half an earlier frame, on a Deck in
+        // Widescreen (the port's author, 2026-09-06 and 2026-09-12). This is
+        // the first recorded use of a fresh target, ahead of the RAM read,
+        // so the clear lands under it: black on every platform, as Windows
+        // already showed.
+        if (snapFreshMemory) {
+            snapFreshMemory = false;
+            snapOpTrace(worker, this, "freshClearColor", "");
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture.get(), RenderTextureLayout::COLOR_WRITE));
+            worker->commandList->setFramebuffer(textureFramebuffer.get());
+            worker->commandList->clearColor();
+            markForResolve();
         }
     }
 
@@ -153,12 +192,34 @@ namespace RT64 {
             const RenderTexture *colorTexture = dummyTexture.get();
             textureFramebuffer = worker->device->createFramebuffer(RenderFramebufferDesc(&colorTexture, 1, texture.get()));
         }
+
+        // Pokemon Snap port: the same first-use clear as the colour target's
+        // (setupColorFramebuffer): stale depth in the expansion's margins
+        // would reject geometry there at random.
+        if (snapFreshMemory) {
+            snapFreshMemory = false;
+            snapOpTrace(worker, this, "freshClearDepth", "");
+            RenderTextureBarrier clearBarriers[] = {
+                RenderTextureBarrier(texture.get(), RenderTextureLayout::DEPTH_WRITE),
+                RenderTextureBarrier(dummyTexture.get(), RenderTextureLayout::COLOR_WRITE)
+            };
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, clearBarriers, uint32_t(std::size(clearBarriers)));
+            worker->commandList->setFramebuffer(textureFramebuffer.get());
+            worker->commandList->clearDepth();
+        }
     }
     
     void RenderTarget::copyFromTarget(RenderWorker *worker, RenderTarget *src, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const ShaderLibrary *shaderLibrary) {
         assert(worker != nullptr);
         assert(src != nullptr);
         assert(format != src->format);
+        if (snapdiag::opTraceEnabled()) {
+            char detail[200];
+            snprintf(detail, sizeof(detail), "from %08X %s %ux%u rev %llu tex %p samples %u, rect (%u,%u %ux%u)", src->addressForName,
+                (src->type == Framebuffer::Type::Depth) ? "depth" : "color", src->width, src->height, (unsigned long long)src->textureRevision,
+                (const void *)src->texture.get(), src->multisampling.sampleCount, x, y, width, height);
+            snapOpTrace(worker, this, "copyFromTarget", detail);
+        }
 
         // Select shader based on the formats.
         RenderTextureLayout requiredTextureLayout = RenderTextureLayout::UNKNOWN;
@@ -218,6 +279,12 @@ namespace RT64 {
         assert(!usesResolve() && "The target must not be an MSAA target to allow resolving from other targets.");
 
         const bool hwResolve = shaderLibrary->usesHardwareResolve && worker->device->getCapabilities().resolveRegion;
+        if (snapdiag::opTraceEnabled()) {
+            char detail[160];
+            snprintf(detail, sizeof(detail), "from %08X %ux%u rev %llu tex %p samples %u, hw %d", src->addressForName, src->width, src->height,
+                (unsigned long long)src->textureRevision, (const void *)src->texture.get(), src->multisampling.sampleCount, hwResolve ? 1 : 0);
+            snapOpTrace(worker, this, "resolveFromTarget", detail);
+        }
         RenderTextureBarrier resolveBarriers[] = {
             RenderTextureBarrier(src->texture.get(), hwResolve ? RenderTextureLayout::RESOLVE_SOURCE : RenderTextureLayout::SHADER_READ),
             RenderTextureBarrier(texture.get(), hwResolve ? RenderTextureLayout::RESOLVE_DEST : RenderTextureLayout::COLOR_WRITE)
@@ -243,6 +310,69 @@ namespace RT64 {
         downsampleMultiplier = src->downsampleMultiplier;
         misalignX = src->misalignX;
         invMisalignX = src->invMisalignX;
+    }
+
+    // Pokemon Snap port: the whole picture of one single-sampled colour target
+    // drawn into another through the rasterizer, with the texture copy shader
+    // the tile copies use, instead of being recorded as a transfer. RT64
+    // keeps transfer commands away from its render targets on purpose
+    // (hle/rt64_framebuffer_manager.cpp, the copy regions: "does not behave
+    // consistently enough across hardware"), and the cut-transit hold was
+    // the port's one transfer into such a target (interpolated target 0,
+    // which resolves are written to). Made while the Deck's top-left chunk
+    // was being hunted, and NOT that fault's cure -- the chunk was the
+    // driver's NGG culling (src/main.cpp, snap_radv_debug_nonggc) -- but
+    // kept for the reason RT64 gives: every write to the target then goes
+    // through the same colour path. Verified to show the same picture by
+    // presented-frame capture of the intro's holds on Windows (Vulkan,
+    // anti-aliasing 4x at 90 Hz, 2026-09-12).
+    void RenderTarget::snapCopyFromTargetRaster(RenderWorker *worker, RenderTarget *src, const ShaderLibrary *shaderLibrary) {
+        assert(worker != nullptr);
+        assert(src != nullptr);
+        assert(format == src->format);
+        assert(multisampling.sampleCount == 1);
+        assert(src->multisampling.sampleCount == 1);
+
+        if (src->textureCopyDescSet == nullptr) {
+            src->textureCopyDescSet = std::make_unique<TextureCopyDescriptorSet>(worker->device);
+            src->textureCopyDescSet->setTexture(src->textureCopyDescSet->gInput, src->getResolvedTexture(), RenderTextureLayout::SHADER_READ, src->getResolvedTextureView());
+        }
+
+        setupColorFramebuffer(worker);
+
+        if (snapdiag::opTraceEnabled()) {
+            char detail[160];
+            snprintf(detail, sizeof(detail), "from %08X %ux%u rev %llu tex %p", src->addressForName, src->width, src->height,
+                (unsigned long long)src->textureRevision, (const void *)src->texture.get());
+            snapOpTrace(worker, this, "copyFromTargetRaster", detail);
+        }
+
+        RenderTextureBarrier copyBarriers[] = {
+            RenderTextureBarrier(src->getResolvedTexture(), RenderTextureLayout::SHADER_READ),
+            RenderTextureBarrier(texture.get(), RenderTextureLayout::COLOR_WRITE)
+        };
+
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, copyBarriers, uint32_t(std::size(copyBarriers)));
+        worker->commandList->setFramebuffer(textureFramebuffer.get());
+
+        const uint32_t copyWidth = std::min(width, src->width);
+        const uint32_t copyHeight = std::min(height, src->height);
+        interop::TextureCopyCB copyCB;
+        copyCB.uvScroll = { 0.0f, 0.0f };
+        copyCB.uvScale = { float(copyWidth), float(copyHeight) };
+        copyCB.boxSize = { 1, 1 };
+
+        const ShaderRecord &textureCopy = shaderLibrary->textureCopy;
+        worker->commandList->setPipeline(textureCopy.pipeline.get());
+        worker->commandList->setGraphicsPipelineLayout(textureCopy.pipelineLayout.get());
+        worker->commandList->setVertexBuffers(0, nullptr, 0, nullptr);
+        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(copyWidth), float(copyHeight)));
+        worker->commandList->setScissors(RenderRect(0, 0, int32_t(copyWidth), int32_t(copyHeight)));
+        worker->commandList->setGraphicsDescriptorSet(src->textureCopyDescSet->get(), 0);
+        worker->commandList->setGraphicsPushConstants(0, &copyCB);
+        worker->commandList->drawInstanced(3, 1, 0, 0);
+
+        markForResolve();
     }
 
     void RenderTarget::copyFromChanges(RenderWorker *worker, const FramebufferChange &fbChange, uint32_t fbWidth, uint32_t fbHeight, uint32_t rowStart, const ShaderLibrary *shaderLibrary) {
@@ -303,6 +433,14 @@ namespace RT64 {
             targetTop = rowStart * resolutionScale.y + ((fbHeight * resolutionScale.y) / 2.0f) - (targetHeight / 2.0f);
         }
         
+        if (snapdiag::opTraceEnabled()) {
+            char detail[200];
+            snprintf(detail, sizeof(detail), "fb %ux%u rows from %u, scale %.3fx%.3f pillar %d, drawn at (%.1f,%.1f %.1fx%.1f), change %ux%u",
+                fbWidth, fbHeight, rowStart, float(resolutionScale.x), float(resolutionScale.y), pillarBox ? 1 : 0,
+                targetLeft, targetTop, targetWidth, targetHeight, fbChange.width, fbChange.height);
+            snapOpTrace(worker, this, "copyFromChanges", detail);
+        }
+
         // Record the drawing command.
         long scissorLeft = long(floor(targetLeft));
         long scissorTop = long(floor(targetTop));
@@ -324,6 +462,7 @@ namespace RT64 {
 
     void RenderTarget::clearColorTarget(RenderWorker *worker) {
         assert(worker != nullptr);
+        snapOpTrace(worker, this, "clearColorTarget", "");
 
         setupColorFramebuffer(worker);
 
@@ -336,6 +475,7 @@ namespace RT64 {
 
     void RenderTarget::clearDepthTarget(RenderWorker *worker) {
         assert(worker != nullptr);
+        snapOpTrace(worker, this, "clearDepthTarget", "");
 
         setupDepthFramebuffer(worker);
         
@@ -413,6 +553,7 @@ namespace RT64 {
         }
 
         const bool hwResolve = shaderLibrary->usesHardwareResolve;
+        snapOpTrace(worker, this, "resolveTarget", hwResolve ? "hw" : "raster");
         RenderTextureBarrier resolveBarriers[] = {
             RenderTextureBarrier(texture.get(), hwResolve ? RenderTextureLayout::RESOLVE_SOURCE : RenderTextureLayout::SHADER_READ),
             RenderTextureBarrier(resolvedTexture.get(), hwResolve ? RenderTextureLayout::RESOLVE_DEST : RenderTextureLayout::COLOR_WRITE)
@@ -452,6 +593,7 @@ namespace RT64 {
         textureCopyCB.uvScroll.y = float(y);
         textureCopyCB.uvScale.x = float(width);
         textureCopyCB.uvScale.y = float(height);
+        textureCopyCB.boxSize = { 1, 1 };
 
         const ShaderRecord &textureResolve = shaderLibrary->textureResolve;
         worker->commandList->setPipeline(textureResolve.pipeline.get());
