@@ -86,6 +86,10 @@ namespace RT64 {
         int16_t snapPrevDsdx;
         int16_t snapPrevDtdy;
         bool snapRectMapped;
+        // Null unless the rectangle was paired by its element's slide: then
+        // the area the element covered in the two frames, which the rectangle
+        // stays inside on its way between them.
+        FixedRect snapClipRect;
         uint16_t rectLeftOrigin;
         uint16_t rectRightOrigin;
         FixedRect scissorRect;

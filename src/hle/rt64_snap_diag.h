@@ -282,6 +282,13 @@ inline std::atomic<uint32_t> &rectsRevealedCounter() {
     return counter;
 }
 
+// Rectangles paired by their element's slide: an element coming in past the
+// edge it is clipped at, whose strips are told apart by their textures.
+inline std::atomic<uint32_t> &rectsSlidCounter() {
+    static std::atomic<uint32_t> counter = { 0 };
+    return counter;
+}
+
 // Whether screen-space rectangles are interpolated at all.
 //
 // Six explanations for the same artefact have now been tried and none was it,

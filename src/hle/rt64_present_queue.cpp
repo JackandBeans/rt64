@@ -1237,6 +1237,10 @@ namespace {
                                 rectCountChanged, rectElements,
                                 (rectElements > 0) ? (100.0 * double(rectCountChanged) / double(rectElements)) : 0.0,
                                 rectTravelRefused, rectBiggestTravel);
+                            const uint32_t rectsSlid = snapdiag::rectsSlidCounter().exchange(0, std::memory_order_relaxed);
+                            if (rectsSlid > 0) {
+                                fprintf(stdout, "[SNAP-PACE]   2D slid: %u rectangles were paired by their element's slide\n", rectsSlid);
+                            }
                             const uint32_t sizeChanged = snapdiag::rectSizeChangedCounter().exchange(0, std::memory_order_relaxed);
                             const uint32_t biggestSize = snapdiag::rectBiggestSizeChangeCounter().exchange(0, std::memory_order_relaxed);
                             fprintf(stdout, "[SNAP-PACE]   2D size: %u of %u paired rectangles changed size (%.1f%%), largest change %u px\n",

@@ -2137,6 +2137,21 @@ namespace RT64 {
                             triangles.scissor.bottom = std::max(triangles.scissor.top, std::min(triangles.scissor.bottom, revealed.bottom));
                         }
 
+                        // A rectangle paired by its element's slide is on its
+                        // way in past the edge the game clips the element at,
+                        // and the game clips in its own code, not with the
+                        // scissor. It is kept inside what the element covered
+                        // in the two frames, so it does not show beyond that
+                        // edge while it travels.
+                        if ((proj.type == Projection::Type::Rectangle) && call.callDesc.snapRectMapped &&
+                            !call.callDesc.snapClipRect.isNull() && (p.snapRectWeight < 1.0f)) {
+                            const RenderRect box = convertFixedRect(call.callDesc.snapClipRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.rectLeftOrigin, call.callDesc.rectRightOrigin);
+                            triangles.scissor.left = std::max(triangles.scissor.left, box.left);
+                            triangles.scissor.top = std::max(triangles.scissor.top, box.top);
+                            triangles.scissor.right = std::max(triangles.scissor.left, std::min(triangles.scissor.right, box.right));
+                            triangles.scissor.bottom = std::max(triangles.scissor.top, std::min(triangles.scissor.bottom, box.bottom));
+                        }
+
                         bool usesViewport = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
                         if (usesViewport) {
                             triangles.scissor = viewportScissorIntersection(viewportClip, triangles.scissor);

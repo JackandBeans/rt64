@@ -2865,10 +2865,33 @@ namespace RT64 {
     // which twenty rectangles belong together, and the ordinal says which of
     // them this one is, so strip three pairs with strip three rather than
     // with whichever strip happened to land nearest it on screen.
+    //
+    // An element can be drawn more than once in a display list: each black
+    // band around the viewfinder is drawn into the depth image and again into
+    // the picture, 320 wide in the first and aligned to the picture's true
+    // edges in the second. Counted from zero each time, both drawings claimed
+    // ordinal zero, the band in the picture paired with the one in the depth
+    // image of the frame before, and the pair was refused for travelling 320
+    // pixels: the visible bands stepped. A later drawing carries on counting
+    // where the earlier one stopped (a single-rectangle group's count is
+    // kept by RDP::drawRect as its rectangle is drawn).
     void State::snapRectGroupCommand(uint32_t id, bool single) {
-        rdp->extended.global.snapRectId = id;
-        rdp->extended.global.snapRectOrdinal = 0;
-        rdp->extended.global.snapRectSingle = single;
+        auto &global = rdp->extended.global;
+        if (global.snapRectId != 0) {
+            extended.snapRectNext[global.snapRectId] = global.snapRectOrdinal;
+        }
+
+        uint32_t ordinal = 0;
+        if (id != 0) {
+            const auto it = extended.snapRectNext.find(id);
+            if (it != extended.snapRectNext.end()) {
+                ordinal = it->second;
+            }
+        }
+
+        global.snapRectId = id;
+        global.snapRectOrdinal = ordinal;
+        global.snapRectSingle = single;
     }
 
     void State::snapCutHoldCommand() {

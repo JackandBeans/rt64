@@ -1295,12 +1295,17 @@ namespace RT64 {
         drawCall.snapPrevDsdx = 0;
         drawCall.snapPrevDtdy = 0;
         drawCall.snapRectMapped = false;
+        drawCall.snapClipRect = FixedRect();
         if (extended.global.snapRectId != 0) {
             extended.global.snapRectOrdinal++;
 
             // A single-rectangle group has now had its rectangle. Whatever is
-            // drawn next carries no name unless something names it.
+            // drawn next carries no name unless something names it. The
+            // count is kept for the name's next drawing in this display list
+            // (State::snapRectGroupCommand): the viewfinder's black bands are
+            // drawn into the depth image and again into the picture.
             if (extended.global.snapRectSingle) {
+                state->extended.snapRectNext[extended.global.snapRectId] = extended.global.snapRectOrdinal;
                 extended.global.snapRectId = 0;
                 extended.global.snapRectSingle = false;
             }

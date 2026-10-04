@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include "common/rt64_math.h"
@@ -1163,6 +1164,70 @@ namespace RT64 {
         fflush(stdout);
     }
 
+    // The same report for content that has a name and was still left where the
+    // game put it. The reason is the point: an element whose rectangle count
+    // changed with no translation its rectangles agree on, and one that moved
+    // further than a sprite can in a frame, step for different causes and want
+    // different cures. Once per shape and reason, by the rule above.
+    static void snapReportNamedStep(const FixedRect &rect, const char *reason, uint32_t id, uint32_t prevCount, uint32_t curCount) {
+        struct Shape {
+            int32_t width;
+            int32_t height;
+            const char *reason;
+            uint32_t quietFrames;
+            bool used;
+        };
+
+        static Shape shapes[32] = {};
+        static uint32_t frameSerial = 0;
+        frameSerial++;
+
+        const int32_t width = (rect.lrx - rect.ulx) >> 2;
+        const int32_t height = (rect.lry - rect.uly) >> 2;
+        if ((width <= 0) || (height <= 0)) {
+            return;
+        }
+
+        Shape *slot = nullptr;
+        for (Shape &shape : shapes) {
+            if (shape.used && (shape.width == width) && (shape.height == height) && (shape.reason == reason)) {
+                slot = &shape;
+                break;
+            }
+        }
+
+        if (slot != nullptr) {
+            if ((frameSerial - slot->quietFrames) < 240u) {
+                slot->quietFrames = frameSerial;
+                return;
+            }
+
+            slot->quietFrames = frameSerial;
+        }
+        else {
+            for (Shape &shape : shapes) {
+                if (!shape.used) {
+                    slot = &shape;
+                    break;
+                }
+            }
+
+            if (slot == nullptr) {
+                return;
+            }
+
+            slot->used = true;
+            slot->width = width;
+            slot->height = height;
+            slot->reason = reason;
+            slot->quietFrames = frameSerial;
+        }
+
+        fprintf(stdout, "[SNAP-2D] named content STEPPED: %dx%d at (%d,%d) -- %s (element %08X drew %u rectangles, %u the frame before)\n",
+            width, height, rect.ulx >> 2, rect.uly >> 2, reason, id, curCount, prevCount);
+        fflush(stdout);
+    }
+
     // Says what a named rectangle DID between two drawn frames, and therefore
     // which of the two rules will handle it.
     //
@@ -1416,6 +1481,9 @@ namespace RT64 {
             int16_t dsdx;
             int16_t dtdy;
             interop::float4 primColor;
+            // The texture the rectangle sampled, which tells one strip of an
+            // element from another whatever size either was clipped to.
+            uint64_t tex = 0;
         };
 
         thread_local std::unordered_map<uint64_t, PrevRect> prevRects;
@@ -1493,7 +1561,9 @@ namespace RT64 {
                     if (call.snapRectId != 0) {
                         prevRects.insert({ keyOf(call), PrevRect{ call.rect, call.rectDsdx, call.rectDtdy, call.rdpParams.primColor } });
                         prevCounts[call.snapRectId]++;
-                        prevById[call.snapRectId].push_back(PrevRect{ call.rect, call.rectDsdx, call.rectDtdy, call.rdpParams.primColor });
+                        const uint64_t tex = ((call.tileCount > 0) && (call.tileIndex < prevWorkload.drawData.callTiles.size()))
+                            ? prevWorkload.drawData.callTiles[call.tileIndex].tmemHashOrID : 0;
+                        prevById[call.snapRectId].push_back(PrevRect{ call.rect, call.rectDsdx, call.rectDtdy, call.rdpParams.primColor, tex });
                     }
                     else if (countRectStats) {
                         prevUnnamed.insert(cornersOf(call.rect));
@@ -1610,6 +1680,145 @@ namespace RT64 {
             return nullptr;
         };
 
+        // The slide, asked before the vote. An element coming in past the
+        // edge it is clipped at -- the title's corner pieces, a panel of the
+        // HUD, a banner from the top -- has its nearest strip cut to a
+        // different size every frame and gains a strip as each one enters, so
+        // the vote, which pairs rectangles of one size, is left with a single
+        // strip and cannot be held. The sprite library clips in its own code
+        // and loads every strip's whole texture whatever it cuts, so a strip
+        // is the same texture in both frames at any size. Each strip found
+        // once on both sides proposes how far its two edges moved; an edge
+        // held at the clip proposes nothing, a free one proposes the slide.
+        // The distance most edges agree on is the element's, two edges at
+        // least. Every rectangle of the element then came from that far back,
+        // the new strip from beyond the edge included, and the clip rectangle
+        // keeps them inside what the element covered in the two frames.
+        // Compared frame for frame with 1.1.1 on the word PAUSE coming in
+        // from the right: whole letters at a new place in every image.
+        struct Slide {
+            bool tried = false;
+            bool valid = false;
+            int32_t dx = 0;
+            int32_t dy = 0;
+            FixedRect box;
+        };
+        thread_local std::unordered_map<uint32_t, Slide> slides;
+        thread_local std::deque<PrevRect> slideRects;
+        thread_local std::vector<int32_t> slideXs;
+        thread_local std::vector<int32_t> slideYs;
+        slides.clear();
+        slideRects.clear();
+        auto texOf = [&curWorkload](const DrawCall &call) -> uint64_t {
+            return ((call.tileCount > 0) && (call.tileIndex < curWorkload.drawData.callTiles.size()))
+                ? curWorkload.drawData.callTiles[call.tileIndex].tmemHashOrID : 0;
+        };
+        // The value most of them hold and how many hold it; of two held
+        // equally often, the larger, since a held edge always says zero.
+        auto modeOf = [](const std::vector<int32_t> &values, int32_t &mode) {
+            int32_t best = 0;
+            mode = 0;
+            for (const int32_t v : values) {
+                int32_t count = 0;
+                for (const int32_t u : values) {
+                    count += (u == v) ? 1 : 0;
+                }
+                if ((count > best) || ((count == best) && (std::abs(v) > std::abs(mode)))) {
+                    best = count;
+                    mode = v;
+                }
+            }
+            return best;
+        };
+        auto slideFor = [&](const DrawCall &call) -> const PrevRect * {
+            const uint32_t id = call.snapRectId;
+            Slide &slide = slides[id];
+            const auto prevIt = prevById.find(id);
+            const auto curIt = curById.find(id);
+            if (!slide.tried) {
+                slide.tried = true;
+                // On the way in only. An element on its way out has already
+                // lost, in this frame's list, the strips that still showed
+                // in the frame before; moved back, what is left is drawn
+                // without them, and the edge it left by flickers at the
+                // game's rate (seen on the course monitor rolling up).
+                if ((prevIt != prevById.end()) && (curIt != curById.end()) &&
+                    (curIt->second.size() >= prevIt->second.size()) &&
+                    ((prevIt->second.size() * curIt->second.size()) <= 4096)) {
+                    const std::vector<PrevRect> &prevs = prevIt->second;
+                    const std::vector<const DrawCall *> &curs = curIt->second;
+                    slideXs.clear();
+                    slideYs.clear();
+                    for (const DrawCall *c : curs) {
+                        const uint64_t tex = texOf(*c);
+                        if (tex == 0) {
+                            continue;
+                        }
+                        // Once on each side, or the strip cannot be told from
+                        // its twin.
+                        uint32_t curTwins = 0;
+                        for (const DrawCall *c2 : curs) {
+                            curTwins += (texOf(*c2) == tex) ? 1u : 0u;
+                        }
+                        uint32_t prevTwins = 0;
+                        const PrevRect *match = nullptr;
+                        for (const PrevRect &p : prevs) {
+                            if (p.tex == tex) {
+                                prevTwins++;
+                                match = &p;
+                            }
+                        }
+                        if ((curTwins != 1) || (prevTwins != 1) || (c->rectDsdx != match->dsdx) || (c->rectDtdy != match->dtdy)) {
+                            continue;
+                        }
+                        slideXs.push_back(c->rect.ulx - match->rect.ulx);
+                        slideXs.push_back(c->rect.lrx - match->rect.lrx);
+                        slideYs.push_back(c->rect.uly - match->rect.uly);
+                        slideYs.push_back(c->rect.lry - match->rect.lry);
+                    }
+                    int32_t dx = 0;
+                    int32_t dy = 0;
+                    const int32_t supportX = modeOf(slideXs, dx);
+                    const int32_t supportY = modeOf(slideYs, dy);
+                    if ((supportX >= 2) && (supportY >= 2) && ((dx != 0) || (dy != 0)) &&
+                        (std::abs(dx) <= MaxTravel) && (std::abs(dy) <= MaxTravel)) {
+                        slide.valid = true;
+                        slide.dx = dx;
+                        slide.dy = dy;
+                        for (const PrevRect &p : prevs) {
+                            if (!p.rect.isNull()) {
+                                slide.box.merge(p.rect);
+                            }
+                        }
+                        for (const DrawCall *c : curs) {
+                            if (!c->rect.isNull()) {
+                                slide.box.merge(c->rect);
+                            }
+                        }
+                    }
+                }
+            }
+            if (!slide.valid) {
+                return nullptr;
+            }
+            PrevRect from;
+            from.rect = FixedRect(call.rect.ulx - slide.dx, call.rect.uly - slide.dy, call.rect.lrx - slide.dx, call.rect.lry - slide.dy);
+            from.dsdx = call.rectDsdx;
+            from.dtdy = call.rectDtdy;
+            from.primColor = call.rdpParams.primColor;
+            from.tex = texOf(call);
+            if (from.tex != 0) {
+                for (const PrevRect &p : prevIt->second) {
+                    if (p.tex == from.tex) {
+                        from.primColor = p.primColor;
+                        break;
+                    }
+                }
+            }
+            slideRects.push_back(from);
+            return &slideRects.back();
+        };
+
         // While the present queue is photographing a burst, every decision made
         // here is printed against the same game-frame number the pictures carry.
         // A pair line and a captured frame are then two views of one moment: the
@@ -1680,8 +1889,18 @@ namespace RT64 {
                     }
                     if (paired == nullptr) {
                         // The ordinals cannot be trusted (or one is missing):
-                        // the element's translation vote decides.
-                        paired = voteFor(call);
+                        // the element's slide decides, and its translation
+                        // vote where no slide could be read.
+                        paired = slideFor(call);
+                        if (paired != nullptr) {
+                            call.snapClipRect = slides[call.snapRectId].box;
+                            if (countRectStats) {
+                                snapdiag::rectsSlidCounter().fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        else {
+                            paired = voteFor(call);
+                        }
                     }
                     if (paired == nullptr) {
                         if (snapDumpWindow) {
@@ -1692,6 +1911,12 @@ namespace RT64 {
                                 (prevCountIt == prevCounts.end()) ? "new-id" : (countsAgree ? "no-prev-ordinal" : "count-changed, no vote"),
                                 (prevCountIt == prevCounts.end()) ? 0u : prevCountIt->second,
                                 curCounts[call.snapRectId]);
+                        }
+                        // An element drawn for the first time has nowhere to
+                        // have come from; the other two are steps.
+                        if (countRectStats && (prevCountIt != prevCounts.end())) {
+                            snapReportNamedStep(call.rect, countsAgree ? "no rectangle of this ordinal last frame" : "its rectangle count changed and no translation was agreed",
+                                call.snapRectId, prevCountIt->second, curCounts[call.snapRectId]);
                         }
                         continue;
                     }
@@ -1716,6 +1941,8 @@ namespace RT64 {
                     if (travelled) {
                         if (countRectStats) {
                             snapdiag::rectTravelRefusedCounter().fetch_add(1, std::memory_order_relaxed);
+                            snapReportNamedStep(call.rect, "it moved more than 160 pixels in one frame",
+                                call.snapRectId, prevCountIt->second, curCounts[call.snapRectId]);
                         }
                         if (snapDumpWindow) {
                             fprintf(stdout, "[SNAP-PAIR] f%u MISS id %08X ord %u (%d,%d %dx%d) travelled from (%d,%d %dx%d)\n",

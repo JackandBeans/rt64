@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "xxHash/xxh3.h"
 
 #include "common/rt64_emulator_configuration.h"
@@ -139,6 +141,10 @@ namespace RT64 {
             bool vertexTestZActive = false;
             float ditherNoiseStrength = 1.0f;
             bool extendRDRAM = false;
+            // Pokemon Snap port: where each 2D element's rectangle count
+            // stands in this display list, for an element drawn more than
+            // once in it (snapRectGroupCommand).
+            std::unordered_map<uint32_t, uint32_t> snapRectNext;
         };
 
         Extended extended;
