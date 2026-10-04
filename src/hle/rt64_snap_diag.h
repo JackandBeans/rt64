@@ -289,6 +289,19 @@ inline std::atomic<uint32_t> &rectsSlidCounter() {
     return counter;
 }
 
+// Scrolling textures: tiles whose scroll was steady and was placed between
+// the frames, and tiles whose scroll was not (a jump, a stop, a turn) and
+// were drawn where the game put them.
+inline std::atomic<uint32_t> &tilesPlacedCounter() {
+    static std::atomic<uint32_t> counter = { 0 };
+    return counter;
+}
+
+inline std::atomic<uint32_t> &tilesSteppedCounter() {
+    static std::atomic<uint32_t> counter = { 0 };
+    return counter;
+}
+
 // Whether screen-space rectangles are interpolated at all.
 //
 // Six explanations for the same artefact have now been tried and none was it,

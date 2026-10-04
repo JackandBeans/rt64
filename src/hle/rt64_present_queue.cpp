@@ -1241,6 +1241,11 @@ namespace {
                             if (rectsSlid > 0) {
                                 fprintf(stdout, "[SNAP-PACE]   2D slid: %u rectangles were paired by their element's slide\n", rectsSlid);
                             }
+                            const uint32_t tilesPlaced = snapdiag::tilesPlacedCounter().exchange(0, std::memory_order_relaxed);
+                            const uint32_t tilesStepped = snapdiag::tilesSteppedCounter().exchange(0, std::memory_order_relaxed);
+                            if ((tilesPlaced > 0) || (tilesStepped > 0)) {
+                                fprintf(stdout, "[SNAP-PACE]   scrolling textures: %u placed between frames, %u left where the game put them (not steady)\n", tilesPlaced, tilesStepped);
+                            }
                             const uint32_t sizeChanged = snapdiag::rectSizeChangedCounter().exchange(0, std::memory_order_relaxed);
                             const uint32_t biggestSize = snapdiag::rectBiggestSizeChangeCounter().exchange(0, std::memory_order_relaxed);
                             fprintf(stdout, "[SNAP-PACE]   2D size: %u of %u paired rectangles changed size (%.1f%%), largest change %u px\n",

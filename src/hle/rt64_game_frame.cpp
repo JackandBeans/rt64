@@ -1026,6 +1026,10 @@ namespace RT64 {
             const bool wrappedUlt = (curTile.cmt == G_TX_WRAP) && (modulo(integerUlt, curTile.maskt * 4) == modulo(expectedUlt, curTile.maskt * 4));
             const bool wrappedLrs = (curTile.cms == G_TX_WRAP) && (modulo(integerLrs, curTile.masks * 4) == modulo(expectedLrs, curTile.masks * 4));
             const bool wrappedLrt = (curTile.cmt == G_TX_WRAP) && (modulo(integerLrt, curTile.maskt * 4) == modulo(expectedLrt, curTile.maskt * 4));
+            const float beforeUls = curTileMap.deltaUls;
+            const float beforeUlt = curTileMap.deltaUlt;
+            const float beforeLrs = curTileMap.deltaLrs;
+            const float beforeLrt = curTileMap.deltaLrt;
             curTileMap.prevUls = curTile.uls - curTileMap.deltaUls;
             curTileMap.prevUlt = curTile.ult - curTileMap.deltaUlt;
             curTileMap.prevLrs = curTile.lrs - curTileMap.deltaLrs;
@@ -1034,6 +1038,43 @@ namespace RT64 {
             curTileMap.deltaUlt = wrappedUlt || (abs(deltaUlt) >= curTile.maskt * 2) ? curTileMap.deltaUlt : deltaUlt;
             curTileMap.deltaLrs = wrappedLrs || (abs(deltaLrs) >= curTile.masks * 2) ? curTileMap.deltaLrs : deltaLrs;
             curTileMap.deltaLrt = wrappedLrt || (abs(deltaLrt) >= curTile.maskt * 2) ? curTileMap.deltaLrt : deltaLrt;
+
+            // Pokemon Snap port: a scroll is placed between frames only while
+            // it is steady. The tile is drawn from where the last frame's
+            // scroll says it was, so a texture that jumps once -- a picture
+            // stepping to its next cell -- would be drawn sliding there a
+            // frame late. Flowing water moves by about the same amount every
+            // frame; a step moves once and stops. A frame whose scroll is not
+            // about the last one's is drawn where the game put it.
+            const bool tileMoved = (beforeUls != 0.0f) || (beforeUlt != 0.0f) || (beforeLrs != 0.0f) || (beforeLrt != 0.0f);
+            if (tileMoved) {
+                auto steady = [](float now, float before) {
+                    if (before == 0.0f) {
+                        return true;
+                    }
+
+                    if ((now == 0.0f) || ((now < 0.0f) != (before < 0.0f))) {
+                        return false;
+                    }
+
+                    const float ratio = now / before;
+                    return (ratio >= 0.4f) && (ratio <= 2.5f);
+                };
+
+                if (steady(curTileMap.deltaUls, beforeUls) && steady(curTileMap.deltaUlt, beforeUlt) &&
+                    steady(curTileMap.deltaLrs, beforeLrs) && steady(curTileMap.deltaLrt, beforeLrt))
+                {
+                    snapdiag::tilesPlacedCounter().fetch_add(1, std::memory_order_relaxed);
+                }
+                else {
+                    curTileMap.prevUls = curTile.uls;
+                    curTileMap.prevUlt = curTile.ult;
+                    curTileMap.prevLrs = curTile.lrs;
+                    curTileMap.prevLrt = curTile.lrt;
+                    snapdiag::tilesSteppedCounter().fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             curTileMap.mapped = true;
             firstCurWorkloadMap.prevTilesMapped[indices.second] = true;
             tileInterpolationUsed = tileInterpolationUsed || tileScrolled;
