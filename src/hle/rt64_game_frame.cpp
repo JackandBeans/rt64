@@ -1030,49 +1030,61 @@ namespace RT64 {
             const float beforeUlt = curTileMap.deltaUlt;
             const float beforeLrs = curTileMap.deltaLrs;
             const float beforeLrt = curTileMap.deltaLrt;
-            curTileMap.prevUls = curTile.uls - curTileMap.deltaUls;
-            curTileMap.prevUlt = curTile.ult - curTileMap.deltaUlt;
-            curTileMap.prevLrs = curTile.lrs - curTileMap.deltaLrs;
-            curTileMap.prevLrt = curTile.lrt - curTileMap.deltaLrt;
             curTileMap.deltaUls = wrappedUls || (abs(deltaUls) >= curTile.masks * 2) ? curTileMap.deltaUls : deltaUls;
             curTileMap.deltaUlt = wrappedUlt || (abs(deltaUlt) >= curTile.maskt * 2) ? curTileMap.deltaUlt : deltaUlt;
             curTileMap.deltaLrs = wrappedLrs || (abs(deltaLrs) >= curTile.masks * 2) ? curTileMap.deltaLrs : deltaLrs;
             curTileMap.deltaLrt = wrappedLrt || (abs(deltaLrt) >= curTile.maskt * 2) ? curTileMap.deltaLrt : deltaLrt;
 
             // Pokemon Snap port: a scroll is placed between frames only while
-            // it is steady. The tile is drawn from where the last frame's
-            // scroll says it was, so a texture that jumps once -- a picture
-            // stepping to its next cell -- would be drawn sliding there a
-            // frame late. Flowing water moves by about the same amount every
-            // frame; a step moves once and stops. A frame whose scroll is not
-            // about the last one's is drawn where the game put it.
-            const bool tileMoved = (beforeUls != 0.0f) || (beforeUlt != 0.0f) || (beforeLrs != 0.0f) || (beforeLrt != 0.0f);
-            if (tileMoved) {
-                auto steady = [](float now, float before) {
-                    if (before == 0.0f) {
-                        return true;
-                    }
-
-                    if ((now == 0.0f) || ((now < 0.0f) != (before < 0.0f))) {
-                        return false;
-                    }
-
-                    const float ratio = now / before;
-                    return (ratio >= 0.4f) && (ratio <= 2.5f);
-                };
-
-                if (steady(curTileMap.deltaUls, beforeUls) && steady(curTileMap.deltaUlt, beforeUlt) &&
-                    steady(curTileMap.deltaLrs, beforeLrs) && steady(curTileMap.deltaLrt, beforeLrt))
-                {
-                    snapdiag::tilesPlacedCounter().fetch_add(1, std::memory_order_relaxed);
+            // it is steady, each direction by itself, and from where the tile
+            // was.
+            //
+            // The original drew a tile from where the LAST frame's scroll says
+            // it was, whatever this frame's is. A texture that jumps once -- a
+            // picture stepping to its next cell -- was then drawn sliding there
+            // a frame late; a slow scroll that moves on every other frame slid
+            // back on the frames it rested; and a scroll that changed its speed
+            // started each frame in the wrong place. Flowing water moves by
+            // about the same amount every frame. A direction whose scroll this
+            // frame goes the same way as the last one's, and between 0.4 and
+            // 2.5 times as far, is placed from this frame's own start; the
+            // last frame's amount stands in for it only across a wrap, where
+            // this frame's cannot be read. Any other is drawn where the game
+            // put it. S and T are judged apart, so a drift in one does not
+            // stop the other's flow.
+            auto steady = [](float now, float before) {
+                if ((before == 0.0f) || (now == 0.0f) || ((now < 0.0f) != (before < 0.0f))) {
+                    return false;
                 }
-                else {
-                    curTileMap.prevUls = curTile.uls;
-                    curTileMap.prevUlt = curTile.ult;
-                    curTileMap.prevLrs = curTile.lrs;
-                    curTileMap.prevLrt = curTile.lrt;
-                    snapdiag::tilesSteppedCounter().fetch_add(1, std::memory_order_relaxed);
-                }
+
+                const float ratio = now / before;
+                return (ratio >= 0.4f) && (ratio <= 2.5f);
+            };
+
+            auto still = [](float now, float before) {
+                return (now == 0.0f) && (before == 0.0f);
+            };
+
+            // A tile's two edges move together in every case seen; an edge
+            // that stands while the other flows is allowed, one that does
+            // anything else is not.
+            auto placed = [&](float nowA, float beforeA, float nowB, float beforeB) {
+                const bool a = steady(nowA, beforeA);
+                const bool b = steady(nowB, beforeB);
+                return (a || b) && (a || still(nowA, beforeA)) && (b || still(nowB, beforeB));
+            };
+
+            const bool placeS = placed(curTileMap.deltaUls, beforeUls, curTileMap.deltaLrs, beforeLrs);
+            const bool placeT = placed(curTileMap.deltaUlt, beforeUlt, curTileMap.deltaLrt, beforeLrt);
+            curTileMap.prevUls = placeS ? (curTile.uls - curTileMap.deltaUls) : curTile.uls;
+            curTileMap.prevLrs = placeS ? (curTile.lrs - curTileMap.deltaLrs) : curTile.lrs;
+            curTileMap.prevUlt = placeT ? (curTile.ult - curTileMap.deltaUlt) : curTile.ult;
+            curTileMap.prevLrt = placeT ? (curTile.lrt - curTileMap.deltaLrt) : curTile.lrt;
+            if (placeS || placeT) {
+                snapdiag::tilesPlacedCounter().fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (tileScrolled || (beforeUls != 0.0f) || (beforeUlt != 0.0f) || (beforeLrs != 0.0f) || (beforeLrt != 0.0f)) {
+                snapdiag::tilesSteppedCounter().fetch_add(1, std::memory_order_relaxed);
             }
 
             curTileMap.mapped = true;
