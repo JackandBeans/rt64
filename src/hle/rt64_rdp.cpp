@@ -1230,8 +1230,18 @@ namespace RT64 {
         // different modes require adding an extra coordinate. Since this behavior often breaks detection
         // for widescreen hacks, an enhancement option to fix them is available given they're within the
         // tolerance of one pixel from the scissor coordinates.
+        //
+        // Pokemon Snap port: not a rectangle an alignment offset has moved. The
+        // port moves a sprite's rectangles to draw it whole past an edge, or
+        // further right in a wide picture, and one of them can land a pixel
+        // from the scissor's own edge: the film counter's two strips meet
+        // there on a 3:2 window, and the snap opened a seam between them (an
+        // icon one pixel narrow for a frame was the first sign, Oct 4 2026).
+        // Such a rectangle is where it was put, to the quarter pixel.
         const FixedRect &scissorRect = state->rdp->scissorRectStack[scissorStackSize - 1];
-        const bool fixRectLR = state->ext.enhancementConfig->rect.fixRectLR;
+        const bool movedByAlignment = (extAlignment.leftOffset != 0) || (extAlignment.topOffset != 0) ||
+            (extAlignment.rightOffset != 0) || (extAlignment.bottomOffset != 0);
+        const bool fixRectLR = state->ext.enhancementConfig->rect.fixRectLR && !movedByAlignment;
         if (!scissorRect.isNull() && fixRectLR) {
             if ((abs(scissorRect.lrx - lrx) <= 4) && (ulx < scissorRect.lrx)) {
                 lrx = scissorRect.lrx;
