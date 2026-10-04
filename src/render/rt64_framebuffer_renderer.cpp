@@ -2123,7 +2123,34 @@ namespace RT64 {
                             scissorInvRatioScale = 1.0f;
                         }
 
-                        triangles.scissor = convertFixedRect(callScissor, p.resolutionScale, p.fbWidth, scissorInvRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
+                        // Pokemon Snap port: the viewfinder's crop keeps its
+                        // place on the 4:3 picture (snapCropScissor, above),
+                        // so in widescreen the margin beside that picture was
+                        // cropped away on the first frame of raising the
+                        // viewfinder and given back on the last frame of
+                        // lowering it: a jump of the margin's width where the
+                        // rest of the travel is three pixels a frame. The
+                        // crop travels from the picture's true edge instead.
+                        // Its inset from the 4:3 edge, as a share of the
+                        // viewfinder's full thirty pixels, is the share of
+                        // the way it has come from the true edge to its 4:3
+                        // place: nothing at zero, the same box at thirty.
+                        // The side bands follow it (patches/src/border_patch.c).
+                        FixedRect snapWideCrop = callScissor;
+                        const bool usesCameraProj = (proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic);
+                        if (snapCropScissor && usesCameraProj && !callScissor.isNull() && (snapCropInvRatioScale > 0.0f) && (snapCropInvRatioScale < 1.0f) &&
+                            (call.callDesc.scissorLeftOrigin == G_EX_ORIGIN_NONE) && (call.callDesc.scissorRightOrigin == G_EX_ORIGIN_NONE)) {
+                            const float margin = float(p.fbWidth) * 2.0f * ((1.0f / snapCropInvRatioScale) - 1.0f);
+                            const float full = 30.0f * 4.0f;
+                            const float leftInset = float(callScissor.ulx);
+                            const float rightInset = float(int32_t(p.fbWidth) * 4 - callScissor.lrx);
+                            const float leftShare = std::clamp(leftInset / full, 0.0f, 1.0f);
+                            const float rightShare = std::clamp(rightInset / full, 0.0f, 1.0f);
+                            snapWideCrop.ulx = callScissor.ulx - int32_t(std::lround(margin * (1.0f - leftShare)));
+                            snapWideCrop.lrx = callScissor.lrx + int32_t(std::lround(margin * (1.0f - rightShare)));
+                        }
+
+                        triangles.scissor = convertFixedRect(snapWideCrop, p.resolutionScale, p.fbWidth, scissorInvRatioScale, extOriginPercentage, int32_t(horizontalMisalignment), call.callDesc.scissorLeftOrigin, call.callDesc.scissorRightOrigin);
 
                         // Narrowed to the part of an uncovering rectangle that
                         // has been revealed so far. The picture is drawn at the
