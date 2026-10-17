@@ -11,6 +11,8 @@
 #include "shared/rt64_render_target_copy.h"
 #include "shared/rt64_texture_copy.h"
 
+#include <cstdlib>
+
 #include "rt64_raster_shader.h"
 #include "hle/rt64_snap_diag.h"
 
@@ -19,6 +21,19 @@
 namespace RT64 {
     // Pokemon Snap port, diagnostic (SNAP_OP_TRACE): one line per recorded
     // operation on a render target (hle/rt64_snap_diag.h, opTrace).
+    // Pokemon Snap port: a target the card could not make (issue #28). The
+    // port says why, holds Super Sampling for the next start and ends the
+    // run; the call does not return (src/rt64_render_context.cpp).
+    extern "C" void snap_render_target_failed(uint32_t width, uint32_t height, uint32_t samples, const char *what);
+
+    // Pokemon Snap port: SNAP_TARGET_FAIL_TEST makes the first color target
+    // fail as the card would, so the catch can be seen to fire (the release
+    // suite's gpufail check).
+    static bool snapTargetFailTest() {
+        static const bool on = (std::getenv("SNAP_TARGET_FAIL_TEST") != nullptr);
+        return on;
+    }
+
     static void snapOpTrace(RenderWorker *worker, const RenderTarget *target, const char *what, const char *detail) {
         if (!snapdiag::opTraceEnabled()) {
             return;
@@ -100,6 +115,13 @@ namespace RT64 {
         
         RenderClearValue clearValue = RenderClearValue::Color(RenderColor(), format);
         texture = worker->device->createTexture(RenderTextureDesc::ColorTarget(width, height, format, multisampling, &clearValue));
+        if (snapTargetFailTest()) {
+            texture.reset();
+        }
+        if (texture == nullptr) {
+            snap_render_target_failed(width, height, multisampling.sampleCount, "color");
+            return;
+        }
         textureView = texture->createTextureView(RenderTextureViewDesc::Texture2D(format));
         texture->setName("Render Target Color #" + std::to_string(addressForName));
         textureRevision++;
@@ -108,6 +130,10 @@ namespace RT64 {
 
         if (multisampling.sampleCount > 1) {
             resolvedTexture = worker->device->createTexture(RenderTextureDesc::ColorTarget(width, height, format, RenderMultisampling(), &clearValue));
+            if (resolvedTexture == nullptr) {
+                snap_render_target_failed(width, height, 1, "resolved color");
+                return;
+            }
             resolvedTextureView = resolvedTexture->createTextureView(RenderTextureViewDesc::Texture2D(format));
             resolvedTexture->setName("Render Target Color Resolved #" + std::to_string(addressForName));
         }
@@ -126,6 +152,10 @@ namespace RT64 {
         
         RenderClearValue clearValue = RenderClearValue::Depth(RenderDepth(), RenderFormat::D32_FLOAT);
         texture = worker->device->createTexture(RenderTextureDesc::DepthTarget(width, height, format, multisampling, &clearValue));
+        if (texture == nullptr) {
+            snap_render_target_failed(width, height, multisampling.sampleCount, "depth");
+            return;
+        }
         textureView = texture->createTextureView(RenderTextureViewDesc::Texture2D(format));
         texture->setName("Render Target Depth #" + std::to_string(addressForName));
         textureRevision++;
@@ -138,6 +168,10 @@ namespace RT64 {
         
         if (dummyTexture == nullptr) {
             dummyTexture = worker->device->createTexture(RenderTextureDesc::ColorTarget(width, height, colorBufferFormat(usesHDR), multisampling));
+            if (dummyTexture == nullptr) {
+                snap_render_target_failed(width, height, multisampling.sampleCount, "dummy color");
+                return;
+            }
             dummyTexture->setName("Render Target Dummy");
         }
     }
@@ -511,6 +545,10 @@ namespace RT64 {
         uint32_t scaledHeight = std::max(height / downsampleMultiplier, 1U);
         if (downsampledTexture == nullptr) {
             downsampledTexture = worker->device->createTexture(RenderTextureDesc::Texture2D(scaledWidth, scaledHeight, 1, colorBufferFormat(usesHDR), RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
+            if (downsampledTexture == nullptr) {
+                snap_render_target_failed(scaledWidth, scaledHeight, 1, "downsampled color");
+                return;
+            }
             downsampledTexture->setName("Render Target Downsampled");
             downsampledTextureMultiplier = downsampleMultiplier;
         }
