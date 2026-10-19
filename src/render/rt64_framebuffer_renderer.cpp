@@ -2118,8 +2118,27 @@ namespace RT64 {
                         // test is widened for the margins -- vanished there
                         // whatever the game drew. A scissor narrower than
                         // the picture is a crop and stays where the game put it.
+                        //
+                        // The picture is what the frame draws, not the
+                        // framebuffer: a course's intro runs on the main
+                        // camera's starting viewport, 14..304 by 12..232
+                        // (createMainCameras in the game's player.c), and
+                        // nothing in those frames draws wider, so the
+                        // renderer stretches that inset across the wide
+                        // picture for the scene itself. The particles of
+                        // the River's splash carry the same 14..304
+                        // scissor, which the framebuffer test read as a
+                        // crop: cut at the 4:3 picture's 14 and 304 while
+                        // the scene ran to the wide edges. A scissor that
+                        // spans the frame's own scissor is the picture
+                        // too. The viewfinder's crop keeps its place: its
+                        // frames draw the black bands to the wide edges, so
+                        // no scissor inside them spans the frame.
+                        const bool scissorSpansFrame = !fbPair.scissorRect.isNull() &&
+                            (callScissor.ulx <= fbPair.scissorRect.ulx) && (callScissor.lrx >= fbPair.scissorRect.lrx);
                         float scissorInvRatioScale = invRatioScale;
-                        if ((proj.type == Projection::Type::Rectangle) && (callScissor.ulx <= 0) && (callScissor.lrx >= int32_t(p.fbWidth) * 4)) {
+                        if ((proj.type == Projection::Type::Rectangle) &&
+                            (((callScissor.ulx <= 0) && (callScissor.lrx >= int32_t(p.fbWidth) * 4)) || scissorSpansFrame)) {
                             scissorInvRatioScale = 1.0f;
                         }
 
