@@ -981,7 +981,11 @@ namespace {
                     ext.swapChain->setVsyncEnabled(wantVsync);
                     swapChainVsyncEnabled = wantVsync;
                     swapChainVsyncKnown = true;
-                    if (snapdiag::statsEnabled()) {
+                    // Said in every log, not only with the stats on: a report
+                    // of tearing has to show whether the presents were in
+                    // step with the display (issue #30). Once at the first
+                    // present and on each change.
+                    {
                         fprintf(stdout, "[SNAP-VSYNC] %s: display %u Hz, target %u, game %u, presents paced by the %s\n",
                             wantVsync ? "on" : "off", displayRate, targetRate, viOriginalRate,
                             wantVsync ? "display" : "software timer");
