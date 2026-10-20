@@ -7,6 +7,15 @@
 #include "rt64_sampler_library.h"
 
 namespace RT64 {
+    // Snap64 Recomp: the swap chain's pixel format, which the Video Interface
+    // pipelines are built for as well (Vulkan ties a pipeline to its target's
+    // format). Android's surfaces offer RGBA, the desktop's BGRA.
+#if defined(__ANDROID__)
+    static constexpr RenderFormat SwapChainFormat = RenderFormat::R8G8B8A8_UNORM;
+#else
+    static constexpr RenderFormat SwapChainFormat = RenderFormat::B8G8R8A8_UNORM;
+#endif
+
     struct ShaderRecord {
         std::unique_ptr<RenderPipeline> pipeline;
         std::unique_ptr<RenderPipelineLayout> pipelineLayout;
