@@ -6,13 +6,37 @@
 
 #include <cassert>
 
+#if !defined(__ANDROID__)
 #include <nfd.h>
+#endif
 
 namespace RT64 {
     // FileDialog
 
     std::atomic<bool> FileDialog::isOpen = false;
 
+#if defined(__ANDROID__)
+    // Snap64 Recomp: no file dialog on Android (nativefiledialog-extended has
+    // no backend there, and the port never opens one): the calls do nothing
+    // and give an empty path.
+    void FileDialog::initialize() {
+    }
+
+    void FileDialog::finish() {
+    }
+
+    std::filesystem::path FileDialog::getDirectoryPath() {
+        return std::filesystem::path();
+    }
+
+    std::filesystem::path FileDialog::getOpenFilename(const std::vector<FileFilter> &filters) {
+        return std::filesystem::path();
+    }
+
+    std::filesystem::path FileDialog::getSaveFilename(const std::vector<FileFilter> &filters) {
+        return std::filesystem::path();
+    }
+#else
     void FileDialog::initialize() {
         NFD_Init();
     }
@@ -76,4 +100,5 @@ namespace RT64 {
         isOpen = false;
         return path;
     }
+#endif
 };

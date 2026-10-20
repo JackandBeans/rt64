@@ -35,18 +35,14 @@ function(preprocess INFILE OUTFILE OPTIONS)
     endif()
 endfunction()
 
-if (WIN32)
+# Snap64 Recomp: the shader compiler runs on the machine that builds, so it is
+# the host's (a cross build for Android runs the host's dxc on the same
+# shaders); a native build's host is its target, as before. The definitions
+# and the DLL copies below are the target's.
+if (CMAKE_HOST_WIN32)
     set (DXC "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc.exe")
-    add_compile_definitions(
-        NOMINMAX
-        __PRFCHWINTRIN_H
-    )
-
-    # Dependencies that must be next to the DLL.
-    configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll" "dxcompiler.dll" COPYONLY)
-    configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxil.dll" "dxil.dll" COPYONLY)
-elseif (APPLE)
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+elseif (CMAKE_HOST_APPLE)
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
         # find zlib and include in dyld path
         find_library(ZLIB_LIBRARY NAMES z)
         get_filename_component(ZLIB_PATH ${ZLIB_LIBRARY} DIRECTORY)
@@ -58,23 +54,56 @@ elseif (APPLE)
         set (SPIRVCROSS "DYLD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/lib/arm64:$ENV{DYLD_LIBRARY_PATH}" "${PROJECT_SOURCE_DIR}/src/contrib/spirv-cross/bin/arm64/spirv-cross")
     endif()
 else()
-    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
         set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")
     else()
         set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/arm64/dxc-linux")
     endif()
 endif()
+if (WIN32)
+    add_compile_definitions(
+        NOMINMAX
+        __PRFCHWINTRIN_H
+    )
+
+    # Dependencies that must be next to the DLL.
+    configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxcompiler.dll" "dxcompiler.dll" COPYONLY)
+    configure_file("${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxil.dll" "dxil.dll" COPYONLY)
+endif()
 
 set(ZSTD_LEGACY_SUPPORT OFF)
 set(ZSTD_BUILD_STATIC ON)
 set(ZSTD_BUILD_SHARED OFF)
+if (ANDROID)
+    # Snap64 Recomp: the dictionary builder, which nothing here uses, calls
+    # qsort_r, which bionic lacks at the API level the port builds for.
+    set(ZSTD_BUILD_DICTBUILDER OFF)
+endif()
 
-add_subdirectory(src/tools/file_to_c)
+# Snap64 Recomp: file_to_c turns every compiled shader into a C array during
+# the build, so a cross build (Android), which cannot run what it builds,
+# takes one built for the host instead of building its own; RT64_FILE_TO_C
+# is what the shader commands below run and depend on.
+if (CMAKE_CROSSCOMPILING)
+    set(RT64_FILE_TO_C_HOST "" CACHE FILEPATH "A file_to_c built for the machine that builds (a cross build cannot run its own)")
+    if (NOT EXISTS "${RT64_FILE_TO_C_HOST}")
+        message(FATAL_ERROR "This is a cross build, which cannot run the file_to_c it builds: pass -DRT64_FILE_TO_C_HOST=<file_to_c from a native build of this tree>.")
+    endif()
+    set(RT64_FILE_TO_C "${RT64_FILE_TO_C_HOST}")
+else()
+    add_subdirectory(src/tools/file_to_c)
+    set(RT64_FILE_TO_C file_to_c)
+endif()
 add_subdirectory(src/contrib/re-spirv)
-add_subdirectory(src/contrib/nativefiledialog-extended)
+if (NOT ANDROID)
+    # Snap64 Recomp: no file dialog on Android (the library has no backend
+    # there; src/gui/rt64_file_dialog.cpp does nothing there).
+    add_subdirectory(src/contrib/nativefiledialog-extended)
+endif()
 add_subdirectory(src/contrib/zstd/build/cmake)
 
-if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+# Snap64 Recomp: the SDL window on Android as on Linux (the port makes it).
+if (CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND RT64_SDL_WINDOW_VULKAN)
     set(PLUME_SDL_VULKAN_ENABLED TRUE)
 elseif (APPLE)
     set(PLUME_APPLE_RETINA_ENABLED OFF)
@@ -118,8 +147,8 @@ function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         COMMAND ${DXC} ${DXC_SPV_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.spv
         DEPENDS ${FILENAME})
     add_custom_command(OUTPUT ${OUTNAME}.spirv.c
-        COMMAND file_to_c ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
-        DEPENDS ${OUTNAME}.spv file_to_c
+        COMMAND ${RT64_FILE_TO_C} ${OUTNAME}.spv ${TARGET_NAME}BlobSPIRV ${OUTNAME}.spirv.c ${OUTNAME}.spirv.h
+        DEPENDS ${OUTNAME}.spv ${RT64_FILE_TO_C}
         BYPRODUCTS ${OUTNAME}.spirv.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.spirv.c)
 endfunction()
@@ -129,8 +158,8 @@ function(build_shader_dxil_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
         COMMAND ${DXC} ${DXC_DXIL_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.dxil
         DEPENDS ${FILENAME})
     add_custom_command(OUTPUT ${OUTNAME}.dxil.c
-        COMMAND file_to_c ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
-        DEPENDS ${OUTNAME}.dxil file_to_c
+        COMMAND ${RT64_FILE_TO_C} ${OUTNAME}.dxil ${TARGET_NAME}BlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
+        DEPENDS ${OUTNAME}.dxil ${RT64_FILE_TO_C}
         BYPRODUCTS ${OUTNAME}.dxil.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.dxil.c)
 endfunction()
@@ -149,8 +178,8 @@ function(build_shader_msl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
             COMMAND xcrun -sdk macosx metallib ${OUTNAME}.ir -o ${OUTNAME}.metallib
             DEPENDS ${OUTNAME}.ir)
     add_custom_command(OUTPUT ${OUTNAME}.metal.c
-            COMMAND file_to_c ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
-            DEPENDS ${OUTNAME}.metallib file_to_c
+            COMMAND ${RT64_FILE_TO_C} ${OUTNAME}.metallib ${TARGET_NAME}BlobMSL ${OUTNAME}.metal.c ${OUTNAME}.metal.h
+            DEPENDS ${OUTNAME}.metallib ${RT64_FILE_TO_C}
             BYPRODUCTS ${OUTNAME}.metal.h)
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.metal.c)
 endfunction()
@@ -243,8 +272,8 @@ function(preprocess_shader TARGETOBJ SHADERNAME)
     cmake_path(GET OUTNAME PARENT_PATH OUTPUT_DIR)
     preprocess(${FILENAME} ${OUTNAME}.rw ${DXC_COMMON_OPTS})
     add_custom_command(OUTPUT ${OUTNAME}.rw.c
-        COMMAND file_to_c ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
-        DEPENDS ${OUTNAME}.rw file_to_c
+        COMMAND ${RT64_FILE_TO_C} ${OUTNAME}.rw ${TARGET_NAME}Text ${OUTNAME}.rw.c ${OUTNAME}.rw.h
+        DEPENDS ${OUTNAME}.rw ${RT64_FILE_TO_C}
         BYPRODUCTS ${OUTNAME}.rw.h)
     file(MAKE_DIRECTORY ${OUTPUT_DIR})
     target_sources(${TARGETOBJ} PRIVATE ${OUTNAME}.rw.c)
@@ -289,10 +318,11 @@ if (WIN32)
     set(SDL2_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/include")
     set(SDL2_LIBRARIES "SDL2" "SDL2main")
     link_directories("${PROJECT_SOURCE_DIR}/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/lib/x64")
-elseif (TARGET SDL2-static)
+elseif (TARGET SDL2-static OR (ANDROID AND TARGET SDL2))
     # Snap64 Recomp: on macOS the port builds SDL2 from its own vendored tree
-    # as a static library, and set SDL2_INCLUDE_DIRS and SDL2_LIBRARIES to it
-    # before adding this directory; there is no installed package to find.
+    # as a static library, on Android as a shared one, and set
+    # SDL2_INCLUDE_DIRS and SDL2_LIBRARIES to it before adding this
+    # directory; there is no installed package to find.
 else()
     find_package(SDL2 REQUIRED)
 endif()
@@ -305,7 +335,7 @@ add_compile_definitions(
     IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 )
 
-if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+if (CMAKE_SYSTEM_NAME MATCHES "Linux|Android" AND RT64_SDL_WINDOW_VULKAN)
     add_compile_definitions("PLUME_SDL_VULKAN_ENABLED")
     add_compile_definitions("RT64_SDL_WINDOW_VULKAN")
 endif()
@@ -446,13 +476,19 @@ set_target_properties(rt64 PROPERTIES PREFIX "")
 
 # Add common libraries.
 target_link_libraries(rt64 re-spirv)
-target_link_libraries(rt64 nfd)
+if (NOT ANDROID)
+    target_link_libraries(rt64 nfd)
+endif()
 target_link_libraries(rt64 libzstd_static)
 target_link_libraries(rt64 plume)
 
 # Add tools.
-add_subdirectory(src/tools/texture_hasher)
-add_subdirectory(src/tools/texture_packer)
+if (NOT ANDROID)
+    # Snap64 Recomp: programs for the machine that builds, which an Android
+    # build does not make.
+    add_subdirectory(src/tools/texture_hasher)
+    add_subdirectory(src/tools/texture_packer)
+endif()
 
 # Add any Apple-specific source files and libraries
 if (APPLE)
@@ -483,7 +519,9 @@ endif()
 
 target_link_directories(rt64 PRIVATE ${PROJECT_SOURCE_DIR}/src/contrib/dxc)
 
-if (NOT ANDROID)
+if (NOT ANDROID OR RT64_SDL_WINDOW_VULKAN)
+    # Snap64 Recomp: with the SDL window, rt64 calls SDL on Android too, and
+    # takes the port's SDL2 target for its headers.
     target_link_libraries(rt64 ${SDL2_LIBRARIES})
 endif()
 
