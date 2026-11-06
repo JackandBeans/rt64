@@ -55,6 +55,70 @@ namespace snaprefresh {
     constexpr double FlipEveryMostMs = 64000.0; // and the most it can grow to
     constexpr double DisprovedMs = 20000.0;     // a fall this soon after a rise disproves it
 
+    // The screen not answering at startup. Under gamescope, from the first
+    // fullscreen on, every present took the present wait's whole 100 ms limit (an
+    // OLED Deck, Nov 5 2026: about ten frames a second, the game slowed with them)
+    // until a resize that came three seconds later by mistake, and then 6.6 ms. That
+    // start is gone once SDL reads the screen's right size (src/steam_deck.h); why
+    // the screen stops answering otherwise is not known. So this is the net under it:
+    // a stall at startup is answered at once, mildest step first: three presents in
+    // a row at the limit, and the next step. The steps stop when a step works, after
+    // the last, or when startup is over: later on, a screen that does not answer is
+    // a game hidden behind Steam's menu, and is left alone.
+    struct StartupStall {
+        static constexpr double LimitMs = 90.0;      // the wait's limit, as measured
+        static constexpr int RunToAct = 3;
+        static constexpr double StartupMs = 30000.0;
+        static constexpr int LastStep = 3;
+        static constexpr int RunToClear = 30;
+
+        double firstMs = -1.0;
+        int run = 0;
+        int good = 0;
+        int step = 0;
+        bool cleared = false;
+
+        // How long this present waited. The step to take now, or zero.
+        int addWait(double waitMs, double nowMs) {
+            if (firstMs < 0.0) {
+                firstMs = nowMs;
+            }
+            if ((nowMs - firstMs) > StartupMs) {
+                return 0;
+            }
+            if (waitMs < LimitMs) {
+                run = 0;
+                good++;
+                if ((step > 0) && (good >= RunToClear)) {
+                    cleared = true;
+                }
+                return 0;
+            }
+            good = 0;
+            if (cleared || (step >= LastStep)) {
+                return 0;
+            }
+            run++;
+            if (run < RunToAct) {
+                return 0;
+            }
+            run = 0;
+            return ++step;
+        }
+
+        // True once, when a step has been followed by a run of good presents.
+        bool sayCleared() {
+            if (cleared && !clearedSaid) {
+                clearedSaid = true;
+                return true;
+            }
+            return false;
+        }
+
+    private:
+        bool clearedSaid = false;
+    };
+
     struct Window {
         uint32_t count = 0;
         double medianMs = 0.0;

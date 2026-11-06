@@ -41,6 +41,13 @@ extern "C" std::atomic<int32_t> snap_frame_dump_pending{0};
 // while it captures a displayed sticker slot, so the capture below runs
 // without the diagnostic environment or a schedule.
 extern "C" std::atomic<int32_t> snap_frame_dump_station{0};
+#if SNAP_MEASURED_REFRESH
+// Pokemon Snap port: the present thread asking the window's thread to apply
+// fullscreen again, when the screen has stopped answering at startup
+// (snaprefresh::StartupStall; src/main.cpp takes it): 2 at the screen's own size,
+// 3 through the size SDL reports.
+extern "C" std::atomic<int32_t> snap_present_stall_ask{0};
+#endif
 
 // The Snap Station's printer display (rt64_snap_overlay.h): one picture,
 // replaced whole, shown instead of the frame while it is set.
@@ -106,10 +113,20 @@ namespace {
         return *meter;
     }
 
+    bool snapInGamescope() {
+        static const bool inside = (std::getenv("GAMESCOPE_WAYLAND_DISPLAY") != nullptr);
+        return inside;
+    }
+
+    snaprefresh::StartupStall &snapStartupStall() {
+        static snaprefresh::StartupStall *stall = new snaprefresh::StartupStall();
+        return *stall;
+    }
+
     // Inside gamescope only; a desktop's X server reports the rate it runs at.
     bool snapRefreshMeterOn() {
         static const bool on = []() {
-            if (std::getenv("GAMESCOPE_WAYLAND_DISPLAY") == nullptr) {
+            if (!snapInGamescope()) {
                 return false;
             }
             const char *off = std::getenv("SNAP_NO_MEASURED_REFRESH");
@@ -1063,8 +1080,8 @@ namespace {
 #if SNAP_MEASURED_REFRESH
                 // How long the display held this present back: waiting for a free
                 // image, then for the present before it.
-                const double snapHeldMs = std::chrono::duration<double, std::milli>(snapPTAcquire - snapPTInterp).count() +
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - snapWaitStart).count();
+                const double snapWaitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - snapWaitStart).count();
+                const double snapHeldMs = std::chrono::duration<double, std::milli>(snapPTAcquire - snapPTInterp).count() + snapWaitedMs;
 #endif
 
                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
@@ -1074,6 +1091,28 @@ namespace {
                 presentProfiler.logAndRestart();
 
 #if SNAP_MEASURED_REFRESH
+                // The screen not answering at startup (rt64_snap_refresh.h): the
+                // swap chain made again first, which nobody sees; then the
+                // window's thread applies fullscreen again.
+                if (snapInGamescope() && presentWaitEnabled) {
+                    snaprefresh::StartupStall &stall = snapStartupStall();
+                    const int step = stall.addWait(snapWaitedMs, snapRefreshNowMs());
+                    if (step == 1) {
+                        fprintf(stdout, "[SNAP-VSYNC] the screen is not answering: %d presents in a row took the wait's whole limit; the swap chain is made again\n", snaprefresh::StartupStall::RunToAct);
+                        fflush(stdout);
+                        swapChainValid = false;
+                    }
+                    else if (step > 1) {
+                        fprintf(stdout, "[SNAP-VSYNC] the screen is still not answering; step %d of %d: fullscreen is applied again\n", step, snaprefresh::StartupStall::LastStep);
+                        fflush(stdout);
+                        snap_present_stall_ask.store(step, std::memory_order_relaxed);
+                    }
+                    if (stall.sayCleared()) {
+                        fprintf(stdout, "[SNAP-VSYNC] the screen is answering again, after step %d of %d\n", stall.step, snaprefresh::StartupStall::LastStep);
+                        fflush(stdout);
+                    }
+                }
+
                 // The display's real rate, for the frame rate cap and for how
                 // many frames are made between two of the game's: see
                 // rt64_snap_refresh.h. In step with the display means vsync on,
