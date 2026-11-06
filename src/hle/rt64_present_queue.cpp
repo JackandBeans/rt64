@@ -19,6 +19,17 @@
 #include <thread>
 #include <vector>
 
+// Pokemon Snap port: the display's real rate under gamescope (see the header).
+// Linux desktops only, where the swap chain is always Vulkan's.
+#if defined(__linux__) && !defined(__ANDROID__)
+#   define SNAP_MEASURED_REFRESH 1
+#   include <cstring>
+#   include "plume_vulkan.h"
+#   include "rt64_snap_refresh.h"
+#else
+#   define SNAP_MEASURED_REFRESH 0
+#endif
+
 // Pokemon Snap port: how many more presented images to photograph. Armed from
 // the game side (src/matrix_tags.cpp, src/anim_steps.cpp) and from the workload
 // queue on churn frames, and counted down here as the window is consumed. What
@@ -88,6 +99,44 @@ namespace {
         const bool displayMatched = (displayRate > 0) && (targetRate >= displayRate);
         return (targetRate > 0) && (targetRate > viOriginalRate) && !displayMatched;
     }
+
+#if SNAP_MEASURED_REFRESH
+    snaprefresh::Meter &snapRefreshMeter() {
+        static snaprefresh::Meter *meter = new snaprefresh::Meter();
+        return *meter;
+    }
+
+    // Inside gamescope only; a desktop's X server reports the rate it runs at.
+    bool snapRefreshMeterOn() {
+        static const bool on = []() {
+            if (std::getenv("GAMESCOPE_WAYLAND_DISPLAY") == nullptr) {
+                return false;
+            }
+            const char *off = std::getenv("SNAP_NO_MEASURED_REFRESH");
+            if ((off != nullptr) && (std::strcmp(off, "0") != 0)) {
+                fprintf(stdout, "[SNAP-VSYNC] SNAP_NO_MEASURED_REFRESH: the rate gamescope reports stands\n");
+                fflush(stdout);
+                return false;
+            }
+            return true;
+        }();
+        return on;
+    }
+
+    double snapRefreshNowMs() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Waits for the present just made to reach the screen; the swap chain's own
+    // wait() stops at the one before it. False when it did not get there within
+    // the time allowed (a window nothing is showing), which is no flip to time.
+    bool snapWaitForLastPresent(RenderSwapChain *swapChain) {
+        plume::VulkanSwapChain *vulkan = static_cast<plume::VulkanSwapChain *>(swapChain);
+        constexpr uint64_t timeoutNanoseconds = 40'000'000;
+        return vulkan->desc.enablePresentWait && (vulkan->currentPresentId > 0) &&
+            (vkWaitForPresentKHR(vulkan->commandQueue->device->vk, vulkan->vk, vulkan->currentPresentId, timeoutNanoseconds) == VK_SUCCESS);
+    }
+#endif
 
     // Written at half resolution by default: the artifact is full-screen scale
     // and half res keeps a burst of captures in the tens of megabytes. A
@@ -975,7 +1024,15 @@ namespace {
                 // came back to Original pushed vsync off and nothing turned it
                 // on again, and presents free-ran unsynchronised from then on.
                 const uint32_t displayRate = ext.sharedResources->swapChainRate;
+#if SNAP_MEASURED_REFRESH
+                // Just after the measured rate changes, the target has not
+                // followed yet and the two do not match: the switch stays where
+                // it is, because a change rebuilds the swap chain.
+                const bool softwarePaced = (swapChainVsyncKnown && snapRefreshMeter().settling()) ? !swapChainVsyncEnabled :
+                    snapSoftwarePaced(targetRate, viOriginalRate, displayRate);
+#else
                 const bool softwarePaced = snapSoftwarePaced(targetRate, viOriginalRate, displayRate);
+#endif
                 const bool wantVsync = !softwarePaced;
                 if (!swapChainVsyncKnown || (wantVsync != swapChainVsyncEnabled)) {
                     ext.swapChain->setVsyncEnabled(wantVsync);
@@ -997,15 +1054,85 @@ namespace {
                     Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
                 }
 
+#if SNAP_MEASURED_REFRESH
+                const auto snapWaitStart = std::chrono::steady_clock::now();
+#endif
                 if (presentWaitEnabled) {
                     ext.swapChain->wait();
                 }
+#if SNAP_MEASURED_REFRESH
+                // How long the display held this present back: waiting for a free
+                // image, then for the present before it.
+                const double snapHeldMs = std::chrono::duration<double, std::milli>(snapPTAcquire - snapPTInterp).count() +
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - snapWaitStart).count();
+#endif
 
                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
                 const Timestamp previousPresentTimestamp = presentTimestamp;
                 presentTimestamp = Timer::current();
                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
                 presentProfiler.logAndRestart();
+
+#if SNAP_MEASURED_REFRESH
+                // The display's real rate, for the frame rate cap and for how
+                // many frames are made between two of the game's: see
+                // rt64_snap_refresh.h. In step with the display means vsync on,
+                // the target at or above the rate, and more than the game's own
+                // rate: at the game's own the presents are the game's cadence,
+                // however evenly they come.
+                if (snapRefreshMeterOn()) {
+                    snaprefresh::Meter &meter = snapRefreshMeter();
+                    static bool meterSaid = false;
+                    if (!meterSaid) {
+                        meterSaid = true;
+                        fprintf(stdout, "[SNAP-VSYNC] gamescope reports %u Hz; the display's real rate is measured from the presents (SNAP_NO_MEASURED_REFRESH=1 turns that off)\n", meter.reported);
+                        fflush(stdout);
+                    }
+
+                    const double snapNowMs = snapRefreshNowMs();
+                    bool rateChanged = false;
+                    if (previousPresentTimestamp != Timestamp()) {
+                        const double intervalMs = std::chrono::duration<double, std::milli>(presentTimestamp - previousPresentTimestamp).count();
+                        const bool inStep = swapChainVsyncEnabled && !softwarePaced && (viOriginalRate > 0) && (targetRate > viOriginalRate) && (targetRate >= displayRate);
+                        rateChanged = meter.addInterval(intervalMs, snapHeldMs, inStep, snapNowMs);
+                        if (meter.windowClosed && snapdiag::statsEnabled()) {
+                            const snaprefresh::Window &w = meter.window;
+                            fprintf(stdout, "[SNAP-VSYNC] window: %u presents, median %.2f ms, %.0f%% within 1 ms of it, %.0f%% held back by the display: %.1f Hz, %s\n",
+                                w.count, w.medianMs, w.steady * 100.0, w.held * 100.0, w.hz, (w.wholeHz != 0) ? "steady" : "not steady");
+                            fflush(stdout);
+                        }
+                    }
+
+                    // While a lower rate is in force, one pair of frames waits for
+                    // the screen now and then: the first frame of a tick and the
+                    // one right after it.
+                    if (!rateChanged && swapChainValid && presentWaitEnabled && swapChainVsyncEnabled &&
+                        (meter.flipPairOpen || ((i == 0) && (framesToPresent > 1) && meter.flipSampleDue(snapNowMs)))) {
+                        const bool flipped = snapWaitForLastPresent(ext.swapChain);
+                        const double flippedMs = snapRefreshNowMs();
+                        if (!flipped) {
+                            meter.putOffFlips(flippedMs);
+                        }
+                        else if (meter.flipPairOpen) {
+                            rateChanged = meter.addFlip(flippedMs - meter.flipFirstMs, flippedMs);
+                            if (meter.flipsClosed && snapdiag::statsEnabled()) {
+                                fprintf(stdout, "[SNAP-VSYNC] flips: %u of %u pairs agree on %.2f ms\n", meter.flipsAgreed, snaprefresh::FlipPairs, meter.flipsMs);
+                                fflush(stdout);
+                            }
+                        }
+                        else {
+                            meter.flipPairOpen = true;
+                            meter.flipFirstMs = flippedMs;
+                        }
+                    }
+
+                    if (rateChanged) {
+                        ext.sharedResources->setSwapChainRate(meter.paceBy());
+                        fprintf(stdout, "[SNAP-VSYNC] display measured at %u Hz (gamescope reports %u): pacing by %u\n", meter.seenHz, meter.reported, meter.paceBy());
+                        fflush(stdout);
+                    }
+                }
+#endif
 
                 if (snapdiag::statsEnabled()) {
                     const auto snapPTEnd = std::chrono::steady_clock::now();
@@ -1392,6 +1519,23 @@ namespace {
                         displayTimingRate = newDisplayTimingRate;
                     }
                 }
+
+#if SNAP_MEASURED_REFRESH
+                // The lines above set the rate gamescope reports; a rate measured
+                // below it stands through a resize. The present is timed from a
+                // settled swap chain again after one.
+                if (snapRefreshMeterOn()) {
+                    snaprefresh::Meter &meter = snapRefreshMeter();
+                    meter.reported = std::min(ext.appWindow->getRefreshRate(), displayTimingRate);
+                    if (meter.active() && (ext.sharedResources->swapChainRate != meter.paceBy())) {
+                        ext.sharedResources->setSwapChainRate(meter.paceBy());
+                    }
+                    if (needsResize) {
+                        meter.restartWindow();
+                        meter.flipPairOpen = false;
+                    }
+                }
+#endif
 
                 skipPresent = skipPresent || ext.swapChain->isEmpty();
 
