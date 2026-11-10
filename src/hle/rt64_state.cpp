@@ -76,10 +76,27 @@ namespace RT64 {
         framebufferRenderer = std::make_unique<FramebufferRenderer>(ext.framebufferGraphicsWorker, false, ext.createdGraphicsAPI, ext.shaderLibrary);
         renderFramebufferManager = std::make_unique<RenderFramebufferManager>(ext.device);
 
-        const RenderMultisampling multisampling = RasterShader::generateMultisamplingPattern(ext.userConfig->msaaSampleCount(), ext.device->getCapabilities().sampleLocations);
-        renderTargetManager.setMultisampling(multisampling);
+        // Pokemon Snap port: RT64 draws every frame the game can read back a
+        // second time, at the console's resolution, and writes it to RDRAM.
+        // That copy is drawn at one sample whatever the picture's MSAA. With
+        // samples, the game's photo check read two different things out of
+        // one depth buffer: the copy the score makes of it through a texture
+        // took the nearest of the samples (RtCopyDepthToColorPS), and its
+        // write-back took sample 0 (FbWriteDepthCS), and no sample sits where
+        // the single one does. Without MSAA this is the same as before.
+        renderTargetManager.setMultisampling(RasterShader::generateMultisamplingPattern(RenderSampleCount::COUNT_1, ext.device->getCapabilities().sampleLocations));
         renderTargetManager.setUsesHDR(ext.shaderLibrary->usesHDR);
         updateRenderFlagSampleCount();
+    }
+
+    void State::setReadBackShaderCache(RasterShaderCache *cache) {
+        ext.rasterShaderCacheReadBack = cache;
+    }
+
+    // The cache whose pipelines draw into this State's single-sample targets:
+    // the picture's own without MSAA, the single-sample one with it.
+    RasterShaderCache *State::readBackShaderCache() const {
+        return (ext.rasterShaderCacheReadBack != nullptr) ? ext.rasterShaderCacheReadBack : ext.rasterShaderCache;
     }
 
     void State::reset() {
@@ -1164,6 +1181,9 @@ namespace RT64 {
                     // Ignore any calls that use fill type, as they're emulated without using a shader.
                     if (callDesc.otherMode.cycleType() != G_CYC_FILL) {
                         ext.rasterShaderCache->submit(shaderDesc);
+                        if (ext.rasterShaderCacheReadBack != nullptr) {
+                            ext.rasterShaderCacheReadBack->submit(shaderDesc);
+                        }
                     }
 
                     interop::RenderParams renderParams;
@@ -1214,6 +1234,9 @@ namespace RT64 {
         // Make sure pipelines for the ubershader have been created before rendering. This condition is executed regardless
         // of whether rendering to RAM is active so the workload queue is guaranteed to have the pipelines ready as well.
         ext.rasterShaderCache->shaderUber->waitForPipelineCreation();
+        if (renderToRDRAM && (ext.rasterShaderCacheReadBack != nullptr)) {
+            ext.rasterShaderCacheReadBack->shaderUber->waitForPipelineCreation();
+        }
 
         if (renderToRDRAM) {
             const hlslpp::float2 resolutionScale(1.0f, 1.0f);
@@ -1360,7 +1383,7 @@ namespace RT64 {
                         drawParams.fbHeight = colorHeight;
                         drawParams.targetWidth = fbPair.colorImage.width;
                         drawParams.targetHeight = colorHeight;
-                        drawParams.rasterShaderCache = ext.rasterShaderCache;
+                        drawParams.rasterShaderCache = readBackShaderCache();
                         drawParams.resolutionScale = resolutionScale;
                         drawParams.aspectRatioSource = 1.0f;
                         drawParams.aspectRatioTarget = 1.0f;
@@ -2084,10 +2107,11 @@ namespace RT64 {
     }
 
     void State::updateMultisampling() {
-        const RenderMultisampling multisampling = RasterShader::generateMultisamplingPattern(ext.userConfig->msaaSampleCount(), ext.device->getCapabilities().sampleLocations);
+        // Pokemon Snap port: the frames the game reads back stay at one
+        // sample (State::setup); only the picture's sample count changed.
         renderFramebufferManager->destroyAll();
         renderTargetManager.destroyAll();
-        renderTargetManager.setMultisampling(multisampling);
+        renderTargetManager.setMultisampling(RasterShader::generateMultisamplingPattern(RenderSampleCount::COUNT_1, ext.device->getCapabilities().sampleLocations));
         dummyDepthTarget.reset();
         framebufferRenderer->updateMultisampling();
         updateRenderFlagSampleCount();
@@ -2956,8 +2980,12 @@ namespace RT64 {
         rdp->clearExtended();
     }
 
+    // The flag goes into every draw's shader description, which the picture
+    // draws with too, so it is the picture's sample count, not this State's
+    // single-sample targets'. The single-sample pixel shader ignores it.
     void State::updateRenderFlagSampleCount() {
-        switch (renderTargetManager.multisampling.sampleCount) {
+        const RenderMultisampling pictureMultisampling = RasterShader::generateMultisamplingPattern(ext.userConfig->msaaSampleCount(), ext.device->getCapabilities().sampleLocations);
+        switch (pictureMultisampling.sampleCount) {
         case RenderSampleCount::COUNT_1:
             renderFlagSampleCount = 0;
             break;

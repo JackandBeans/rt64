@@ -34,6 +34,10 @@ namespace RT64 {
         ShaderRecord fbChangesClear;
         ShaderRecord fbChangesDrawColor;
         ShaderRecord fbChangesDrawDepth;
+        // Pokemon Snap port: single-sample copies of the two above, made only
+        // while MSAA is on, for the targets of the frames the game reads back.
+        ShaderRecord fbChangesDrawColorSingle;
+        ShaderRecord fbChangesDrawDepthSingle;
         ShaderRecord fbReadAnyChanges;
         ShaderRecord fbReadAnyFull;
         ShaderRecord fbReinterpret;

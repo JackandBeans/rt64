@@ -59,12 +59,24 @@ namespace RT64 {
         std::filesystem::path seenListPath;
         bool replayingSeenList = false;
 
+        // Pokemon Snap port: the cache of the picture (true), or the
+        // single-sample cache that draws the frames the game reads back while
+        // the picture has MSAA (false, State's render to RAM). That one borrows
+        // the picture's blob store, replays its seen list without adding to it,
+        // and stays out of the [SNAP-SHADER] lines and the pacing counters,
+        // which describe the picture.
+        bool snapPictureCache = true;
+        ShaderBlobCache *borrowedBlobCache = nullptr;
+
         RasterShaderCache(uint32_t threadCount, uint32_t ubershaderThreadCount);
         ~RasterShaderCache();
         void setup(RenderDevice *device, RenderShaderFormat shaderFormat, const ShaderLibrary *shaderLibrary, const RenderMultisampling &multisampling);
         void openBlobCache(const std::filesystem::path &path);
-        void openSeenList(const std::filesystem::path &path);
-        void submit(const ShaderDescription &desc);
+        void borrowBlobCache(ShaderBlobCache *cache);
+        ShaderBlobCache *activeBlobCache() const;
+        void openSeenList(const std::filesystem::path &path, bool record = true);
+        ShaderDescription keyFor(const ShaderDescription &desc) const;
+        void submit(const ShaderDescription &descIn);
         void waitForAll();
         void destroyAll();
         RasterShader *getGPUShader(const ShaderDescription &desc);

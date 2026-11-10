@@ -61,11 +61,15 @@ namespace RT64 {
                 assert((shaderCache->shaderUber != nullptr) && "Ubershader should've been created by the time a new shader is submitted to the cache.");
                 const RenderPipelineLayout *uberPipelineLayout = shaderCache->shaderUber->pipelineLayout.get();
                 const RenderMultisampling multisampling = shaderCache->multisampling;
-                std::unique_ptr<RasterShader> newShader = std::make_unique<RasterShader>(shaderCache->device, shaderDesc, uberPipelineLayout, shaderCache->shaderFormat, multisampling, shaderCache->shaderCompiler.get(), &shaderCache->optimizerCacheSPIRV, shaderCache->blobCache.get());
+                std::unique_ptr<RasterShader> newShader = std::make_unique<RasterShader>(shaderCache->device, shaderDesc, uberPipelineLayout, shaderCache->shaderFormat, multisampling, shaderCache->shaderCompiler.get(), &shaderCache->optimizerCacheSPIRV, shaderCache->activeBlobCache());
 
                 {
                     const std::unique_lock<std::mutex> lock(shaderCache->GPUShadersMutex);
                     shaderCache->GPUShaders[shaderDesc.hash()] = std::move(newShader);
+                }
+
+                if (!shaderCache->snapPictureCache) {
+                    continue;
                 }
 
                 snapdiag::shaderReadyCounter().fetch_add(1, std::memory_order_relaxed);
@@ -136,18 +140,33 @@ namespace RT64 {
         blobCache->open(path, device);
     }
 
+    // Pokemon Snap port: the single-sample cache for the frames the game reads
+    // back uses the picture cache's store. It is safe to share: every lookup
+    // and store takes the store's own lock, and the sample count is part of
+    // every key.
+    void RasterShaderCache::borrowBlobCache(ShaderBlobCache *cache) {
+        borrowedBlobCache = cache;
+    }
+
+    ShaderBlobCache *RasterShaderCache::activeBlobCache() const {
+        return (blobCache != nullptr) ? blobCache.get() : borrowedBlobCache;
+    }
+
     // Pokemon Snap port: replay every shader this machine has ever needed,
     // before the game needs any of them. The DXIL blob cache and the driver
     // pipeline library make each replayed compile near-free on a warm
     // machine; on a cold one the work happens during the boot logos on idle
     // threads instead of as a present stall the first time a Pokemon walks
     // on screen. The file is raw packed ShaderDescriptions behind a version
-    // guard; a size mismatch discards it wholesale.
-    void RasterShaderCache::openSeenList(const std::filesystem::path &path) {
+    // guard; a size mismatch discards it wholesale. With record false the
+    // list is only replayed: the cache that records it is the picture's.
+    void RasterShaderCache::openSeenList(const std::filesystem::path &path, bool record) {
         if (path.empty()) {
             return;
         }
-        seenListPath = path;
+        if (record) {
+            seenListPath = path;
+        }
 
         FILE *f = nullptr;
 #if defined(_WIN32)
@@ -174,19 +193,40 @@ namespace RT64 {
             replayingSeenList = false;
         }
         fclose(f);
-        if (!headerOk) {
+        if (!headerOk && record) {
             // A stale layout must not keep collecting appends behind a bad
             // header; recording restarts clean.
             std::error_code ec;
             std::filesystem::remove(path, ec);
         }
         if (replayed > 0) {
-            fprintf(stdout, "[SNAP-SHADER] warming %zu shaders from the seen list\n", replayed);
+            if (snapPictureCache) {
+                fprintf(stdout, "[SNAP-SHADER] warming %zu shaders from the seen list\n", replayed);
+            }
+            else {
+                fprintf(stdout, "[SNAP-SHADER] warming %zu single-sample shaders for the frames the game reads back\n", replayed);
+            }
             fflush(stdout);
         }
     }
 
-    void RasterShaderCache::submit(const ShaderDescription &desc) {
+    // Pokemon Snap port: the read-back cache compiles each description as a
+    // session without MSAA would. The draws carry the picture's sample count
+    // in their flags; clearing it makes its shaders the very ones such a
+    // session makes, with the same keys in the store. The single-sample pixel
+    // shader never reads the count.
+    ShaderDescription RasterShaderCache::keyFor(const ShaderDescription &desc) const {
+        if (snapPictureCache) {
+            return desc;
+        }
+
+        ShaderDescription single = desc;
+        single.flags.sampleCount = 0;
+        return single;
+    }
+
+    void RasterShaderCache::submit(const ShaderDescription &descIn) {
+        const ShaderDescription desc = keyFor(descIn);
         {
             std::unique_lock<std::mutex> queueLock(submissionMutex);
 
@@ -198,7 +238,9 @@ namespace RT64 {
             }
 
             found = true;
-            snapdiag::shaderAskedCounter().fetch_add(1, std::memory_order_relaxed);
+            if (snapPictureCache) {
+                snapdiag::shaderAskedCounter().fetch_add(1, std::memory_order_relaxed);
+            }
 
             // A genuinely new shader joins the seen list, so the next launch
             // warms it. Replayed submissions are already in the file.
@@ -228,7 +270,7 @@ namespace RT64 {
             // equality and blending. An object that is visible exactly once,
             // at first sight, and never again would look like this handoff.
             // The submission and the completion below bracket the window.
-            if (snapdiag::diagEnabled()) {
+            if (snapPictureCache && snapdiag::diagEnabled()) {
                 fprintf(stdout, "[SNAP-SHADER] submit %016llX om %08X %08X cc %08X %08X cyc %u zc %u zu %u zm %u\n",
                     (unsigned long long)shaderHash, desc.otherMode.H, desc.otherMode.L,
                     desc.colorCombiner.H, desc.colorCombiner.L,
@@ -274,7 +316,7 @@ namespace RT64 {
     }
 
     RasterShader *RasterShaderCache::getGPUShader(const ShaderDescription &desc) {
-        const uint64_t shaderHash = desc.hash();
+        const uint64_t shaderHash = keyFor(desc).hash();
 
         const std::unique_lock<std::mutex> lock(GPUShadersMutex);
         auto shaderIt = GPUShaders.find(shaderHash);

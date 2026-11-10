@@ -57,6 +57,10 @@ namespace RT64 {
             PresentQueue *presentQueue;
             SharedQueueResources *sharedQueueResources;
             RasterShaderCache *rasterShaderCache;
+            // Pokemon Snap port: the single-sample cache the frames the game
+            // reads back are drawn with while the picture has MSAA; null
+            // without MSAA, when rasterShaderCache is already single-sample.
+            RasterShaderCache *rasterShaderCacheReadBack = nullptr;
             TextureCache *textureCache;
             EmulatorConfiguration *emulatorConfig;
             EnhancementConfiguration *enhancementConfig;
@@ -192,5 +196,7 @@ namespace RT64 {
         void disableExtendedGBI();
         void clearExtended();
         void updateRenderFlagSampleCount();
+        void setReadBackShaderCache(RasterShaderCache *cache);
+        RasterShaderCache *readBackShaderCache() const;
     };
 };

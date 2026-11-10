@@ -127,6 +127,9 @@ namespace RT64 {
         std::unique_ptr<RenderWorker> workloadGraphicsWorker;
         std::unique_ptr<RenderWorker> presentGraphicsWorker;
         std::unique_ptr<RasterShaderCache> rasterShaderCache;
+        // Pokemon Snap port: single-sample pipelines for the frames the game
+        // reads back, made only while the picture has MSAA (State::setup).
+        std::unique_ptr<RasterShaderCache> rasterShaderCacheReadBack;
         // The driver's own pipeline store, carried between runs. Separate from
         // the shader bytecode cache: that one skips compiling a shader, this one
         // skips the driver building a pipeline out of it, and they are different
@@ -163,6 +166,7 @@ namespace RT64 {
         void updateScreen();
         void destroyShaderCache();
         void updateMultisampling();
+        void updateReadBackShaderCache(const RenderMultisampling &multisampling);
         void end();
         bool loadConfiguration();
         bool saveConfiguration();

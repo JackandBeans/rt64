@@ -465,6 +465,8 @@ namespace RT64 {
             rasterShaderCache->openSeenList(userPaths.shaderCachePath.parent_path() / "rt64-seen-shaders.bin");
         }
 
+        updateReadBackShaderCache(multisampling);
+
 #   if RT_ENABLED
         if (device->getCapabilities().raytracing) {
             rtShaderCache = std::make_unique<RaytracingShaderCache>(device.get(), renderInterface->getCapabilities().shaderFormat, shaderLibrary.get());
@@ -550,6 +552,7 @@ namespace RT64 {
         stateExt.presentQueue = presentQueue.get();
         stateExt.sharedQueueResources = sharedQueueResources.get();
         stateExt.rasterShaderCache = rasterShaderCache.get();
+        stateExt.rasterShaderCacheReadBack = rasterShaderCacheReadBack.get();
         stateExt.textureCache = textureCache.get();
         stateExt.emulatorConfig = &emulatorConfig;
         stateExt.enhancementConfig = &enhancementConfig;
@@ -632,6 +635,38 @@ namespace RT64 {
         presentQueue->waitForIdle();
         rasterShaderCache->waitForAll();
         rasterShaderCache->destroyAll();
+        if (rasterShaderCacheReadBack != nullptr) {
+            rasterShaderCacheReadBack->waitForAll();
+            rasterShaderCacheReadBack->destroyAll();
+        }
+    }
+
+    // Pokemon Snap port: the frames the game reads back are drawn at one
+    // sample (State::setup). Without MSAA the picture's cache is already
+    // single-sample and draws them, as before. With MSAA they get pipelines of
+    // their own, compiled from the same descriptions, kept in the same store
+    // and warmed from the same list.
+    void Application::updateReadBackShaderCache(const RenderMultisampling &multisampling) {
+        if (multisampling.sampleCount <= 1) {
+            rasterShaderCacheReadBack.reset();
+            return;
+        }
+
+        if (rasterShaderCacheReadBack == nullptr) {
+            const uint32_t rasterShaderThreads = std::max(threadsAvailable / 2U, 1U);
+            const uint32_t ubershaderThreads = uint32_t(std::max(int(threadsAvailable) - 2, 1));
+            rasterShaderCacheReadBack = std::make_unique<RasterShaderCache>(rasterShaderThreads, ubershaderThreads);
+            rasterShaderCacheReadBack->snapPictureCache = false;
+            rasterShaderCacheReadBack->setup(device.get(), renderInterface->getCapabilities().shaderFormat, shaderLibrary.get(),
+                RasterShader::generateMultisamplingPattern(RenderSampleCount::COUNT_1, device->getCapabilities().sampleLocations));
+            rasterShaderCacheReadBack->borrowBlobCache(rasterShaderCache->activeBlobCache());
+            if (!userPaths.isEmpty()) {
+                rasterShaderCacheReadBack->openSeenList(userPaths.shaderCachePath.parent_path() / "rt64-seen-shaders.bin", false);
+            }
+        }
+
+        fprintf(stdout, "[SNAP-CFG] MSAA: the picture has %u samples; the frames the game reads back are drawn at one\n", uint32_t(multisampling.sampleCount));
+        fflush(stdout);
     }
 
     void Application::updateMultisampling() {
@@ -651,6 +686,8 @@ namespace RT64 {
 
         // Set up shader cache again with new ubershaders.
         rasterShaderCache->setup(device.get(), renderInterface->getCapabilities().shaderFormat, shaderLibrary.get(), multisampling);
+        updateReadBackShaderCache(multisampling);
+        state->setReadBackShaderCache(rasterShaderCacheReadBack.get());
 
         // Destroy the render target managers for both the state and the queues and configure them with the new multisampling.
         // This also implies the destruction of the contents of the framebuffer managers too.
@@ -660,6 +697,9 @@ namespace RT64 {
 
         // Wait for all pipelines of the ubershader to be ready again.
         rasterShaderCache->shaderUber->waitForPipelineCreation();
+        if (rasterShaderCacheReadBack != nullptr) {
+            rasterShaderCacheReadBack->shaderUber->waitForPipelineCreation();
+        }
     }
 
 #ifdef _WIN32
@@ -808,7 +848,9 @@ namespace RT64 {
         sharedQueueResources.reset();
         // Destroying the shader cache joins every compilation thread, so past
         // this line no pipeline is being created and the driver's store can be
-        // read without a question about concurrency.
+        // read without a question about concurrency. The read-back cache
+        // borrows the picture cache's store, so it goes first.
+        rasterShaderCacheReadBack.reset();
         rasterShaderCache.reset();
 
         if (devicePipelineCache != nullptr) {

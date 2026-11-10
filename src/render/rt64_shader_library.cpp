@@ -783,6 +783,35 @@ namespace RT64 {
             pipelineDesc.depthWriteEnabled = true;
             pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
             fbChangesDrawDepth.pipeline = device->createGraphicsPipeline(pipelineDesc);
+
+            // Pokemon Snap port: with MSAA on, the frames the game reads back
+            // are still drawn at one sample (State), and their targets take
+            // memory through these two. Without MSAA the two above are already
+            // single-sample and these stay empty.
+            fbChangesDrawColorSingle = ShaderRecord();
+            fbChangesDrawDepthSingle = ShaderRecord();
+            if (multisampling.sampleCount > 1) {
+                fbChangesDrawColorSingle.pipelineLayout = layoutBuilder.create(device);
+                fbChangesDrawDepthSingle.pipelineLayout = layoutBuilder.create(device);
+
+                RenderGraphicsPipelineDesc singleDesc;
+                singleDesc.pipelineLayout = fbChangesDrawColorSingle.pipelineLayout.get();
+                singleDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+                singleDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(usesHDR);
+                singleDesc.renderTargetCount = 1;
+                singleDesc.vertexShader = fullScreenVertexShader.get();
+                singleDesc.pixelShader = colorShader.get();
+                singleDesc.multisampling = RenderMultisampling();
+                fbChangesDrawColorSingle.pipeline = device->createGraphicsPipeline(singleDesc);
+
+                singleDesc.pipelineLayout = fbChangesDrawDepthSingle.pipelineLayout.get();
+                singleDesc.pixelShader = depthShader.get();
+                singleDesc.depthEnabled = true;
+                singleDesc.depthFunction = RenderComparisonFunction::ALWAYS;
+                singleDesc.depthWriteEnabled = true;
+                singleDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
+                fbChangesDrawDepthSingle.pipeline = device->createGraphicsPipeline(singleDesc);
+            }
         }
 
         // Copy color to depth and depth to color.

@@ -413,18 +413,21 @@ namespace RT64 {
         assert(worker != nullptr);
         assert(fbChange.used);
 
-        // Select shader based on the formats.
+        // Select shader based on the formats. Pokemon Snap port: a
+        // single-sample target while MSAA is on (the frames the game reads
+        // back) takes the single-sample pipelines; those exist only then.
         RenderTextureLayout requiredTextureLayout = RenderTextureLayout::UNKNOWN;
         const ShaderRecord *shaderRecord = nullptr;
         bool useDummyTexture = false;
+        const bool singleOnMultisampled = (multisampling.sampleCount == 1) && (shaderLibrary->fbChangesDrawColorSingle.pipeline != nullptr);
         if (format == colorBufferFormat(usesHDR)) {
-            shaderRecord = &shaderLibrary->fbChangesDrawColor;
+            shaderRecord = singleOnMultisampled ? &shaderLibrary->fbChangesDrawColorSingle : &shaderLibrary->fbChangesDrawColor;
             requiredTextureLayout = RenderTextureLayout::COLOR_WRITE;
             setupColorFramebuffer(worker);
         }
         else if (format == depthBufferFormat()) {
             useDummyTexture = true;
-            shaderRecord = &shaderLibrary->fbChangesDrawDepth;
+            shaderRecord = singleOnMultisampled ? &shaderLibrary->fbChangesDrawDepthSingle : &shaderLibrary->fbChangesDrawDepth;
             requiredTextureLayout = RenderTextureLayout::DEPTH_WRITE;
             setupDepthFramebuffer(worker);
         }
