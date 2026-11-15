@@ -22,16 +22,27 @@ namespace RT64 {
     // Pokemon Snap port, diagnostic (SNAP_OP_TRACE): one line per recorded
     // operation on a render target (hle/rt64_snap_diag.h, opTrace).
     // Pokemon Snap port: a target the card could not make (issue #28). The
-    // port says why, holds Super Sampling for the next start and ends the
+    // port says why, lowers one setting for the next start and ends the
     // run; the call does not return (src/rt64_render_context.cpp).
     extern "C" void snap_render_target_failed(uint32_t width, uint32_t height, uint32_t samples, const char *what);
 
-    // Pokemon Snap port: SNAP_TARGET_FAIL_TEST makes the first color target
-    // fail as the card would, so the catch can be seen to fire (the release
-    // suite's gpufail check).
-    static bool snapTargetFailTest() {
-        static const bool on = (std::getenv("SNAP_TARGET_FAIL_TEST") != nullptr);
-        return on;
+    // Pokemon Snap port: SNAP_TARGET_FAIL_TEST makes a color target fail as
+    // the card would, so the catch can be seen to fire (the release suite's
+    // gpufail, msaafail and catch checks). With 1, or any word, it is the
+    // first one, which is made at one times the console's size, before the
+    // first frame has told the renderer the window's. With a larger number
+    // it is the first at least that many lines high: a target at the
+    // window's scale, which is what the catch's Render Scale step needs.
+    static bool snapTargetFailTest(uint32_t height) {
+        static const uint32_t least = []() -> uint32_t {
+            const char *value = std::getenv("SNAP_TARGET_FAIL_TEST");
+            if (value == nullptr) {
+                return 0;
+            }
+            const unsigned long lines = std::strtoul(value, nullptr, 10);
+            return uint32_t(std::clamp(lines, 1ul, 65535ul));
+        }();
+        return (least != 0) && (height >= least);
     }
 
     static void snapOpTrace(RenderWorker *worker, const RenderTarget *target, const char *what, const char *detail) {
@@ -115,7 +126,7 @@ namespace RT64 {
         
         RenderClearValue clearValue = RenderClearValue::Color(RenderColor(), format);
         texture = worker->device->createTexture(RenderTextureDesc::ColorTarget(width, height, format, multisampling, &clearValue));
-        if (snapTargetFailTest()) {
+        if (snapTargetFailTest(height)) {
             texture.reset();
         }
         if (texture == nullptr) {
