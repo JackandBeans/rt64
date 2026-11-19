@@ -435,6 +435,19 @@ namespace RT64 {
             targetBlend.dstBlendAlpha = RenderBlend::ONE;
         }
 
+#   if defined(__APPLE__)
+        // Metal on Intel GPUs: a fragment function with a second (dual-source) colour output and a depth
+        // output never writes depth when the pipeline's blend does not read that second output -- blending
+        // off, or a blend made only of ONE and ZERO -- so every opaque draw left the depth buffer untouched.
+        // Without alpha blending the shader's secondary output is exactly 1.0 (RasterPS sets it so and only
+        // alpha blending changes it), so weighting the source by SRC1_ALPHA is the same copy, bit for bit,
+        // and keeps the driver writing depth.
+        if (!c.alphaBlend) {
+            targetBlend.blendEnabled = true;
+            targetBlend.srcBlend = RenderBlend::SRC1_ALPHA;
+        }
+#   endif
+
         return c.device->createGraphicsPipeline(pipelineDesc);
     }
     
